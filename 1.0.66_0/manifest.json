@@ -38,6 +38,10 @@
       "matches": [ "\u003Call_urls>" ],
       "run_at": "document_start",
       "world": "MAIN"
+   }, {
+      "js": [ "assets/arc-session-border.js" ],
+      "matches": [ "\u003Call_urls>" ],
+      "run_at": "document_idle"
    } ],
    "content_security_policy": {
       "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' https://api.anthropic.com https://*.anthropic.com wss://api.anthropic.com https://claude.ai https://*.claude.ai https://platform.claude.com https://api.segment.io https://*.segment.com https://*.ingest.us.sentry.io https://api.honeycomb.io https://browser-intake-us5-datadoghq.com wss://bridge.claudeusercontent.com wss://bridge-staging.claudeusercontent.com https://*.claudeusercontent.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:;"

@@ -51,6 +51,10 @@ async function _getActiveTabId() {
   return active?.id;
 }
 
+function _touchSession(tabId) {
+  try { self._arcSessionTracker?.touch(tabId); } catch (e) {}
+}
+
 const TOOL_HANDLERS = {
   async tabs_context_mcp(args) {
     const { createIfEmpty } = args || {};
@@ -65,6 +69,7 @@ const TOOL_HANDLERS = {
 
   async tabs_create_mcp(_args) {
     const newTab = await chrome.tabs.create({ active: false, url: 'about:blank' });
+    _touchSession(newTab.id);
     return _buildTabContext(newTab.id);
   },
 
@@ -90,6 +95,7 @@ const TOOL_HANDLERS = {
       targetTabId = await _getActiveTabId();
       if (!targetTabId) {
         const t = await chrome.tabs.create({ url, active: true });
+        _touchSession(t.id);
         return _ok(`Navigated new tab ${t.id} to ${url}`);
       }
     }
@@ -102,6 +108,7 @@ const TOOL_HANDLERS = {
     if (force !== false) {
       await chrome.tabs.update(targetTabId, { active: true });
     }
+    _touchSession(targetTabId);
     return _ok(`Navigated tab ${targetTabId} to ${url}`);
   },
 
@@ -128,6 +135,7 @@ const TOOL_HANDLERS = {
       if (text.length > limit) {
         text = text.slice(0, limit) + `\n\n[Truncated at ${limit} characters]`;
       }
+      _touchSession(targetTabId);
       return _ok(text);
     } catch (e) {
       return _err(`Failed to read page text: ${e.message}`);
@@ -156,6 +164,7 @@ const TOOL_HANDLERS = {
       await new Promise(r => setTimeout(r, 300));
       const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
       const base64 = dataUrl.replace(/^data:image\/png;base64,/, '');
+      _touchSession(targetTabId);
       return {
         content: [{
           type: 'image',

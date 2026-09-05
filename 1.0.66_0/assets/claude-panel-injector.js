@@ -344,6 +344,9 @@
     hostEl.style.setProperty('right', '0px', 'important');
     applyLayoutSqueeze(panelWidth / currentZoom);
     savePanelState();
+    if (extOk() && tabId) {
+      chrome.runtime.sendMessage({ type: 'ARC_SESSION_ANCHOR_OPEN', tabId }).catch(() => {});
+    }
   }
 
   function hidePanel() {
@@ -353,6 +356,9 @@
     removeLayoutSqueeze();
     setTimeout(() => { if (!panelVisible) hostEl.style.setProperty('display', 'none', 'important'); }, ANIMATION_DURATION);
     savePanelState();
+    if (extOk() && currentTabId) {
+      chrome.runtime.sendMessage({ type: 'ARC_SESSION_ANCHOR_CLOSE', tabId: currentTabId }).catch(() => {});
+    }
   }
 
   function savePanelState() {

@@ -30,12 +30,14 @@ async function handleCommand(command) {
         active: params.active !== false,
         windowId: params.windowId
       });
+      self._arcSessionTracker?.touch(tab.id);
       return { success: true, tabId: tab.id, windowId: tab.windowId };
     }
 
     case 'navigate': {
       if (!CAPABILITIES.tabs) return { error: 'tabs API unavailable' };
       const tab = await chrome.tabs.update(params.tabId, { url: params.url });
+      self._arcSessionTracker?.touch(tab.id);
       return { success: true, tabId: tab.id };
     }
 
@@ -104,6 +106,7 @@ async function handleCommand(command) {
         func: new Function(params.code),
         world: params.world || 'ISOLATED'
       });
+      self._arcSessionTracker?.touch(params.tabId);
       return { success: true, results: results.map(r => r.result) };
     }
 
