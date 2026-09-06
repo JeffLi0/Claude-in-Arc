@@ -10,23 +10,6 @@ Arc is Chromium-based, but it omits several extension APIs the official Claude e
 
 ---
 
-## The problem
-
-Arc is Chromium-based, but it doesn't implement three of the extension APIs Claude for Chrome is built on — and a fourth assumption breaks simply because of how the panel has to be hosted here:
-
-| What's missing | What breaks |
-| --- | --- |
-| `chrome.sidePanel` | The Claude panel never opens |
-| `chrome.tabGroups` | Claude's multi-tab session tracking never resolves, so there's no way to see which tabs a task is touching |
-| `chrome.debugger` | Clicking, typing, scrolling and JavaScript execution hang until the request times out |
-| A real side panel | The Cowork panel refuses to authenticate, reporting *"Can't reach the Claude extension"* despite a valid session |
-
-The `chrome.debugger` case is the nastiest, because it doesn't fail — it *stalls*. The official extension drives every page interaction through the Chrome Debugger Protocol, and in Arc the `attach` call never settles. No error is raised and no result is ever returned, so the only symptom is a timeout several seconds later: *"the tool did not respond in time."*
-
-The last row is subtler still. Since Arc has no side panel, this fork renders `sidepanel.html` inside a tab. The Cowork experience embeds claude.ai in a child iframe, and the service worker only answers that page's `get_sidepanel_host_info` request when it sees `sender.tab === undefined` — its test for "am I hosted in a real side panel?" A tab-hosted panel can never satisfy it, so sign-in appears to fail even though the OAuth exchange succeeded and the tokens were stored correctly.
-
----
-
 ## Installation
 
 Download **`Claude-in-Arc-v0.3.zip`** from [Releases](https://github.com/JeffLi0/Claude-in-Arc/releases) and unzip it. Then in Arc:
@@ -41,13 +24,22 @@ The patched build deliberately drops the `update_url` from its manifest, so Arc 
 
 Go to `arc://extensions` and click **Remove Extension**.
 
-### Building the ZIP yourself
+---
 
-```bash
-./build-release.sh
-```
+## The problem
 
-Packages `1.0.91_1/` into `Claude-in-Arc-v0.3.zip`, excluding CRX install metadata and `.DS_Store`. The version in the filename is read from the manifest's `version_name`.
+Arc is Chromium-based, but it doesn't implement three of the extension APIs Claude for Chrome is built on — and a fourth assumption breaks simply because of how the panel has to be hosted here:
+
+| What's missing | What breaks |
+| --- | --- |
+| `chrome.sidePanel` | The Claude panel never opens |
+| `chrome.tabGroups` | Claude's multi-tab session tracking never resolves, so there's no way to see which tabs a task is touching |
+| `chrome.debugger` | Clicking, typing, scrolling and JavaScript execution hang until the request times out |
+| A real side panel | The Cowork panel refuses to authenticate, reporting *"Can't reach the Claude extension"* despite a valid session |
+
+The `chrome.debugger` case is the nastiest, because it doesn't fail — it *stalls*. The official extension drives every page interaction through the Chrome Debugger Protocol, and in Arc the `attach` call never settles. No error is raised and no result is ever returned, so the only symptom is a timeout several seconds later: *"the tool did not respond in time."*
+
+The last row is subtler still. Since Arc has no side panel, this fork renders `sidepanel.html` inside a tab. The Cowork experience embeds claude.ai in a child iframe, and the service worker only answers that page's `get_sidepanel_host_info` request when it sees `sender.tab === undefined` — its test for "am I hosted in a real side panel?" A tab-hosted panel can never satisfy it, so sign-in appears to fail even though the OAuth exchange succeeded and the tokens were stored correctly.
 
 ---
 
