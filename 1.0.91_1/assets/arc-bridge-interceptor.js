@@ -131,6 +131,47 @@ async function _toCssCoords(tabId, coordinate) {
   return [x, y];
 }
 
+const _ZOOM_MAX_SIDE = 1568;
+const _ZOOM_MAX_UPSCALE = 4;
+
+function _b64ToBytes(base64) {
+  const bin = atob(base64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function _bytesToB64(bytes) {
+  let out = '';
+  // btoa takes a string; chunk it so the argument list stays a sane size.
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    out += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(out);
+}
+
+/**
+ * Crop a region out of a base64 PNG and rescale it, entirely in the worker.
+ * Decoding goes through a Blob rather than fetch(dataUrl) so nothing touches
+ * connect-src, which the extension CSP would refuse.
+ */
+async function _cropPngBase64(base64, sx, sy, sw, sh, dw, dh) {
+  const blob = new Blob([_b64ToBytes(base64)], { type: 'image/png' });
+  const bitmap = await createImageBitmap(blob);
+  try {
+    const canvas = new OffscreenCanvas(dw, dh);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('OffscreenCanvas 2d context unavailable.');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(bitmap, sx, sy, sw, sh, 0, 0, dw, dh);
+    const outBlob = await canvas.convertToBlob({ type: 'image/png' });
+    return _bytesToB64(new Uint8Array(await outBlob.arrayBuffer()));
+  } finally {
+    bitmap.close();
+  }
+}
+
 /** Width/height straight out of a base64 PNG's IHDR header. */
 function _pngSize(base64) {
   try {
@@ -540,6 +581,62 @@ function _pageDrag(x0, y0, x1, y1) {
   };
 }
 
+// --------------------------------------------------------------------------
+// read_page / find.
+//
+// Both official tools call window.__generateAccessibilityTree, which the
+// accessibility-tree content script defines. Routed through the official
+// executor in Arc they come back "Page script returned empty result", so they
+// are rebuilt here on the injection path the rest of this file already uses:
+// inject Anthropic's own tree builder, then call it. MAIN world first (proven
+// to work in Arc), ISOLATED as the fallback for pages whose CSP blocks it --
+// where the content script's own copy usually already lives.
+// --------------------------------------------------------------------------
+
+const _AXTREE_FILE = 'assets/accessibility-tree.js-B-oUarrX.js';
+const _AXTREE_WORLDS = ['MAIN', 'ISOLATED'];
+const _FIND_MAX_HITS = 25;
+
+function _pageAxTree(filter, depth, maxChars, refId) {
+  if (typeof window.__generateAccessibilityTree !== 'function') {
+    return { error: 'The accessibility tree builder is not present on this page.' };
+  }
+  try {
+    return window.__generateAccessibilityTree(filter, depth, maxChars, refId);
+  } catch (e) {
+    return { error: (e && e.message) || String(e) };
+  }
+}
+
+function _pageScrollToRef(ref) {
+  const map = window.__claudeElementMap;
+  const holder = map && map[ref];
+  const el = holder && typeof holder.deref === 'function' ? holder.deref() : null;
+  if (!el) return { error: `Element ${ref} is not on this page any more. Call read_page again.` };
+  el.scrollIntoView({ block: 'center', inline: 'nearest' });
+  return { ok: `Scrolled to ${ref}.` };
+}
+
+/** Build the tree, trying each world until one produces it. */
+async function _axTree(tabId, { filter, depth, maxChars, refId }) {
+  let lastError = 'no result';
+  for (const world of _AXTREE_WORLDS) {
+    try {
+      await chrome.scripting.executeScript({ target: { tabId }, world, files: [_AXTREE_FILE] });
+      const res = await _runInTab(
+        tabId, _pageAxTree,
+        [filter || null, depth ?? null, maxChars ?? _MAX_PAGE_TEXT, refId ?? null],
+        world
+      );
+      if (res && !res.error && typeof res.pageContent === 'string') return { tree: res, world };
+      lastError = res?.error || 'the page script returned nothing';
+    } catch (e) {
+      lastError = e.message || String(e);
+    }
+  }
+  return { error: lastError };
+}
+
 const TOOL_HANDLERS = {
   async tabs_context_mcp(args) {
     const { createIfEmpty } = args || {};
@@ -627,6 +724,63 @@ const TOOL_HANDLERS = {
     }
   },
 
+  async read_page(args) {
+    const { tabId, filter, depth, ref_id, max_chars } = args || {};
+    const resolved = await _resolveTabId(tabId);
+    if (resolved.error) return _err(resolved.error);
+
+    const { tree, error } = await _axTree(resolved.id, {
+      filter, depth, maxChars: max_chars, refId: ref_id
+    });
+    if (error) return _err(`Failed to read page: ${error}`);
+    if (tree.error) return _err(tree.error);
+
+    _touchSession(resolved.id);
+    const vp = tree.viewport || {};
+    return _ok(`${tree.pageContent}\n\nViewport: ${vp.width}x${vp.height}`);
+  },
+
+  /**
+   * The official find asks a small model to pick elements out of the tree.
+   * That inference isn't reachable from here, so this matches the query
+   * literally against the tree instead and hands back the lines it hit,
+   * refs included. Narrower than the real thing, and it says so.
+   */
+  async find(args) {
+    const { tabId, query } = args || {};
+    if (!query || !String(query).trim()) return _err('query is required for find.');
+    const resolved = await _resolveTabId(tabId);
+    if (resolved.error) return _err(resolved.error);
+
+    const { tree, error } = await _axTree(resolved.id, { filter: 'all', maxChars: 400000 });
+    if (error) return _err(`Failed to find element: ${error}`);
+    if (tree.error) return _err(tree.error);
+
+    const terms = String(query).toLowerCase().split(/\s+/).filter(Boolean);
+    const hits = [];
+    for (const line of tree.pageContent.split('\n')) {
+      const hay = line.toLowerCase();
+      let score = 0;
+      for (const t of terms) if (hay.includes(t)) score++;
+      if (score > 0) hits.push({ line, score });
+    }
+    hits.sort((a, b) => b.score - a.score);
+
+    _touchSession(resolved.id);
+    if (hits.length === 0) {
+      return _ok(
+        `No element matched "${query}". This is a literal match over the accessibility ` +
+        'tree, not the model-backed finder, so try single distinctive words, or call ' +
+        'read_page and pick the element yourself.'
+      );
+    }
+    const shown = hits.slice(0, _FIND_MAX_HITS).map(h => h.line.trim()).join('\n');
+    const more = hits.length > _FIND_MAX_HITS ? `\n[${hits.length - _FIND_MAX_HITS} more matches not shown]` : '';
+    return _ok(
+      `Literal matches for "${query}" (Arc build: text match, not the model-backed finder):\n${shown}${more}`
+    );
+  },
+
   async javascript_tool(args) {
     const { action, text, tabId } = args || {};
     if (action && action !== 'javascript_exec') {
@@ -663,7 +817,8 @@ const TOOL_HANDLERS = {
   async computer(args) {
     const {
       action, tabId, coordinate, start_coordinate,
-      text, duration, scroll_direction, scroll_amount
+      text, duration, scroll_direction, scroll_amount,
+      region, scale, ref
     } = args || {};
 
     const resolved = await _resolveTabId(tabId);
@@ -773,16 +928,95 @@ const TOOL_HANDLERS = {
           return run(_pageDrag, [x0, y0, x1, y1]);
         }
 
-        case 'scroll_to':
-          return _err(
-            'scroll_to resolves element references from read_page, which the Arc interceptor ' +
-            'does not track. Take a screenshot and scroll by coordinate instead.'
-          );
+        case 'scroll_to': {
+          if (!ref) return _err('ref is required for the scroll_to action.');
+          let last = null;
+          for (const world of _AXTREE_WORLDS) {
+            last = await _runInTab(targetTabId, _pageScrollToRef, [String(ref)], world);
+            if (last && last.ok) {
+              _touchSession(targetTabId);
+              return _ok(last.ok);
+            }
+          }
+          return _err(last?.error || 'Could not resolve that element reference.');
+        }
 
-        case 'zoom':
-          return _err(
-            'zoom is not implemented in the Arc interceptor. Take a screenshot instead.'
-          );
+        case 'zoom': {
+          // The official zoom clips Page.captureScreenshot through the debugger.
+          // Arc never attaches, so capture the whole viewport and crop it here.
+          if (!Array.isArray(region) || region.length !== 4) {
+            return _err('region [x0, y0, x1, y1] is required for the zoom action.');
+          }
+          const [rx0, ry0] = await _toCssCoords(targetTabId, [region[0], region[1]]);
+          const [rx1, ry1] = await _toCssCoords(targetTabId, [region[2], region[3]]);
+          if (rx0 < 0 || ry0 < 0 || rx1 <= rx0 || ry1 <= ry0) {
+            return _err('Invalid region: x0 and y0 must be >= 0, x1 > x0 and y1 > y0.');
+          }
+
+          const vp = await _runInTab(targetTabId, _pageViewport, []);
+          if (!vp) return _err('Could not measure the viewport to zoom.');
+          if (rx1 > vp.w + 1 || ry1 > vp.h + 1) {
+            return _err(
+              `Region exceeds the viewport (${Math.round(vp.w)}x${Math.round(vp.h)} CSS px). ` +
+              'Choose a region inside the visible area, or scroll first.'
+            );
+          }
+
+          const tab = await chrome.tabs.get(targetTabId);
+          await chrome.tabs.update(targetTabId, { active: true });
+          if (tab.windowId) await chrome.windows.update(tab.windowId, { focused: true });
+          await new Promise(r => setTimeout(r, 300));
+          const shotUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+          const shot = shotUrl.replace(/^data:image\/png;base64,/, '');
+
+          // captureVisibleTab renders at devicePixelRatio; the region is in CSS px.
+          const size = _pngSize(shot);
+          const ratio = size && vp.w ? size.w / vp.w : (vp.dpr || 1);
+          const sx = Math.max(0, Math.round(rx0 * ratio));
+          const sy = Math.max(0, Math.round(ry0 * ratio));
+          const sw = Math.max(1, Math.min(Math.round((rx1 - rx0) * ratio), (size?.w || Infinity) - sx));
+          const sh = Math.max(1, Math.min(Math.round((ry1 - ry0) * ratio), (size?.h || Infinity) - sy));
+
+          // Scale up so small regions are actually legible, but stay inside the
+          // model's image budget. `scale` (0.1-1) shrinks, matching the official tool.
+          const shrink = Number.isFinite(Number(scale)) && Number(scale) >= 0.1 && Number(scale) <= 1
+            ? Number(scale)
+            : 1;
+          const fit = Math.min(_ZOOM_MAX_SIDE / sw, _ZOOM_MAX_SIDE / sh, _ZOOM_MAX_UPSCALE);
+          const factor = Math.max(0.1, Math.min(fit, _ZOOM_MAX_UPSCALE)) * shrink;
+          const dw = Math.max(1, Math.round(sw * factor));
+          const dh = Math.max(1, Math.round(sh * factor));
+
+          let cropped;
+          try {
+            cropped = await _cropPngBase64(shot, sx, sy, sw, sh, dw, dh);
+          } catch (e) {
+            return _err(`Could not crop the zoomed region: ${e.message || String(e)}`);
+          }
+
+          await _rememberShotDims(targetTabId, {
+            imgW: size?.w || Math.round(vp.w * ratio),
+            imgH: size?.h || Math.round(vp.h * ratio),
+            cssW: vp.w,
+            cssH: vp.h
+          });
+          _touchSession(targetTabId);
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Zoomed region (${Math.round(region[0])}, ${Math.round(region[1])}) to ` +
+                      `(${Math.round(region[2])}, ${Math.round(region[3])}) - ${dw}x${dh} pixels. ` +
+                      'Coordinates for clicks still come from a full screenshot, not this crop.'
+              },
+              {
+                type: 'image',
+                source: { type: 'base64', media_type: 'image/png', data: cropped }
+              }
+            ]
+          };
+        }
 
         default:
           return _err(`Unknown computer action "${action}".`);
