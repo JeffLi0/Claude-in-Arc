@@ -33,11 +33,13 @@ Arc is Chromium-based, but it doesn't implement three of the extension APIs Clau
 | What's missing | What breaks |
 | --- | --- |
 | `chrome.sidePanel` | The Claude panel never opens |
-| `chrome.tabGroups` | Claude's multi-tab session tracking never resolves, so there's no way to see which tabs a task is touching |
+| `chrome.tabGroups` | Claude's multi-tab session tracking never resolves, and every tool call naming a tab is rejected as outside Claude's tab group |
 | `chrome.debugger` | Clicking, typing, scrolling and JavaScript execution hang until the request times out |
 | A real side panel | The Cowork panel refuses to authenticate, reporting *"Can't reach the Claude extension"* despite a valid session |
 
 The `chrome.debugger` case is the nastiest, because it doesn't fail — it *stalls*. The official extension drives every page interaction through the Chrome Debugger Protocol, and in Arc the `attach` call never settles. No error is raised and no result is ever returned, so the only symptom is a timeout several seconds later: *"the tool did not respond in time."*
+
+The tab-group case fails in a more confusing way. The official extension confines Claude's tools to a Chrome tab group, and checks each call by comparing the target tab's `groupId` against the group it created for the session. Arc has neither half of that, so the group is never established and no tab ever carries its id — every call naming a tab comes back with *"Tab N is not in Claude's tab group for this session."*
 
 The last row is subtler still. Since Arc has no side panel, this fork renders `sidepanel.html` inside a tab. The Cowork experience embeds claude.ai in a child iframe, and the service worker only answers that page's `get_sidepanel_host_info` request when it sees `sender.tab === undefined` — its test for "am I hosted in a real side panel?" A tab-hosted panel can never satisfy it, so sign-in appears to fail even though the OAuth exchange succeeded and the tokens were stored correctly.
 
@@ -65,8 +67,10 @@ Wired into `claude-panel-injector.js` (panel open/close), `arc-bridge-intercepto
 
 **Known limitation:** tool calls arriving over the native-messaging transport (the local Claude Desktop app) bypass the interceptor and go straight to the official executor, so a *new* tab opened mid-task through that path won't be bordered. The anchor tab — wherever the panel is open — is always bordered regardless of transport.
 
-### Sign-in, panel and worker fixes
+### Sign-in, tool routing and panel fixes
 
+- **Tool calls rejected as "not in Claude's tab group".** Tab confinement can't be represented in Arc (see [The problem](#the-problem)), so `getTabForMcp` — and the equivalent check in `tabs_close_mcp` — now skips the group comparison when it detects that the browser has no real tab-group API. The target tab must still exist. This is the fork's one patch to an official bundle, `assets/mcpPermissions-CMuwfoXg.js`; it's applied there rather than in a shim because the same module also runs in the panel, where no shim has loaded.
+- **Duplicate tool results.** The interceptor listened for bridge messages alongside the official handler rather than in place of it, so an intercepted call was answered twice for one `tool_use_id` — and the official reply, which fails instantly in Arc, usually arrived first. Intercepted calls are now hidden from the official `onmessage` handler, and are matched against this device's own bridge id so a call meant for Claude Desktop is left alone.
 - **Classic panel by default.** 1.0.91 defaults `preferCoworkExperience` to on, and Cowork can't authenticate in a tab-hosted panel (see [The problem](#the-problem)). The worker now defaults it off, leaving an explicit user choice untouched.
 - **Panel crash on open.** `claude-panel-injector.js` tracked the fixed/sticky elements it repositions in a `WeakMap`, then called `.entries()` and `.clear()` on it — both `Map`-only methods. `showPanel` threw partway through every open, which surfaced as the panel half-mounting during sign-in.
 - **Service-worker API corruption.** `arc-sidepanel-shim.js` permanently replaced `chrome.tabs.query`, `chrome.tabs.get` and `chrome.storage.local.get` with debug wrappers that dropped every argument after the first, so callback-style calls never got their callback. They're now gated behind the shim's debug flag and forward all arguments.

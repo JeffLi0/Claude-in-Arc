@@ -47,11 +47,23 @@ function _shimLog(hid, msg, data = {}) {
     self._arcBridgeWS = ws;
     self._arcBridgeSend = origSend;
 
+    // Captured from the outgoing `connect` frame. The official worker ignores a
+    // tool_call addressed to another device (the Claude Desktop app, say), so
+    // the interceptor must scope itself the same way.
+    let localDeviceId = null;
+
+    const shouldIntercept = (parsed) => {
+      if (!parsed || parsed.type !== 'tool_call') return false;
+      if (parsed.target_device_id && parsed.target_device_id !== localDeviceId) return false;
+      return !!self._arcBridgeInterceptor?.canHandle(parsed.tool);
+    };
+
     ws.send = function(data) {
       try {
         const parsed = JSON.parse(data);
         const sendLog = { type: parsed.type, client_type: parsed.client_type };
         if (parsed.type === 'connect' && parsed.device_id) {
+          localDeviceId = parsed.device_id;
           sendLog.local_device_id = parsed.device_id.slice(0, 12);
         }
         if (parsed.type === 'tool_result') {
@@ -77,7 +89,7 @@ function _shimLog(hid, msg, data = {}) {
           logData.target_device_id_prefix = parsed.target_device_id ? parsed.target_device_id.slice(0, 12) : '[none]';
           if (self._arcToolCallTracker) self._arcToolCallTracker.onToolCall(parsed.tool, parsed.tool_use_id);
 
-          if (self._arcBridgeInterceptor?.canHandle(parsed.tool)) {
+          if (shouldIntercept(parsed)) {
             logData.intercepted = true;
             _shimLog('INTERCEPT', 'dispatching_tool_call', {
               tool: parsed.tool, tool_use_id: parsed.tool_use_id
@@ -93,12 +105,54 @@ function _shimLog(hid, msg, data = {}) {
                 _shimLog('INTERCEPT', 'tool_call_error', {
                   tool: parsed.tool, tool_use_id: parsed.tool_use_id, error: String(e)
                 });
+                // The official handler no longer sees this call, so nothing else
+                // will answer it. Reply, or the desktop side waits for a timeout.
+                try {
+                  origSend(JSON.stringify({
+                    type: 'tool_result',
+                    tool_use_id: parsed.tool_use_id,
+                    content: [{ type: 'text', text: `Arc interceptor failed: ${String(e)}` }],
+                    is_error: true
+                  }));
+                } catch (sendErr) {}
               });
           }
         }
         _shimLog('H3', 'bridge_ws_message', logData);
       } catch (e) {}
     });
+    // The official worker installs its own `ws.onmessage` and answers every
+    // tool_call it sees, so an intercepted call was being handled twice and two
+    // tool_results were racing for one tool_use_id. The official one usually won
+    // for anything slow (`computer` screenshot activates the tab and waits before
+    // capturing), and in Arc it always loses immediately: `chrome.tabs.group` is a
+    // stub, so no tab ever carries the session's group id and the confinement
+    // check rejects the target with "Tab N is not in Claude's tab group for this
+    // session". Filter those messages out of the official handler's view so the
+    // interceptor's result is the only one sent.
+    const onmessageDesc = Object.getOwnPropertyDescriptor(OrigWS.prototype, 'onmessage');
+    if (onmessageDesc?.set) {
+      let officialHandler = null;
+      Object.defineProperty(ws, 'onmessage', {
+        configurable: true,
+        enumerable: true,
+        get() { return officialHandler; },
+        set(handler) {
+          officialHandler = handler;
+          if (typeof handler !== 'function') {
+            onmessageDesc.set.call(ws, handler);
+            return;
+          }
+          onmessageDesc.set.call(ws, function (evt) {
+            try {
+              if (shouldIntercept(JSON.parse(evt.data))) return undefined;
+            } catch (e) {}
+            return handler.apply(this, arguments);
+          });
+        }
+      });
+    }
+
     ws.addEventListener('close', (evt) => {
       _shimLog('H3', 'bridge_ws_close', { code: evt.code, reason: evt.reason, wasClean: evt.wasClean });
     });
