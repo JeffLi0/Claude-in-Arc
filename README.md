@@ -12,15 +12,18 @@ Arc is Chromium-based, but it omits several extension APIs the official Claude e
 
 ## The problem
 
-Arc is missing three Chrome APIs the official extension depends on:
+Arc is Chromium-based, but it doesn't implement three of the extension APIs Claude for Chrome is built on — and a fourth assumption breaks simply because of how the panel has to be hosted here:
 
-| Missing API | What breaks |
+| What's missing | What breaks |
 | --- | --- |
 | `chrome.sidePanel` | The Claude panel never opens |
 | `chrome.tabGroups` | Claude's multi-tab session tracking never resolves, so there's no way to see which tabs a task is touching |
 | `chrome.debugger` | Clicking, typing, scrolling and JavaScript execution hang until the request times out |
+| A real side panel | The Cowork panel refuses to authenticate, reporting *"Can't reach the Claude extension"* despite a valid session |
 
 The `chrome.debugger` case is the nastiest, because it doesn't fail — it *stalls*. The official extension drives every page interaction through the Chrome Debugger Protocol, and in Arc the `attach` call never settles. No error is raised and no result is ever returned, so the only symptom is a timeout several seconds later: *"the tool did not respond in time."*
+
+The last row is subtler still. Since Arc has no side panel, this fork renders `sidepanel.html` inside a tab. The Cowork experience embeds claude.ai in a child iframe, and the service worker only answers that page's `get_sidepanel_host_info` request when it sees `sender.tab === undefined` — its test for "am I hosted in a real side panel?" A tab-hosted panel can never satisfy it, so sign-in appears to fail even though the OAuth exchange succeeded and the tokens were stored correctly.
 
 ---
 
@@ -70,6 +73,12 @@ Wired into `claude-panel-injector.js` (panel open/close), `arc-bridge-intercepto
 
 **Known limitation:** tool calls arriving over the native-messaging transport (the local Claude Desktop app) bypass the interceptor and go straight to the official executor, so a *new* tab opened mid-task through that path won't be bordered. The anchor tab — wherever the panel is open — is always bordered regardless of transport.
 
+### Sign-in, panel and worker fixes
+
+- **Classic panel by default.** 1.0.91 defaults `preferCoworkExperience` to on, and Cowork can't authenticate in a tab-hosted panel (see [The problem](#the-problem)). The worker now defaults it off, leaving an explicit user choice untouched.
+- **Panel crash on open.** `claude-panel-injector.js` tracked the fixed/sticky elements it repositions in a `WeakMap`, then called `.entries()` and `.clear()` on it — both `Map`-only methods. `showPanel` threw partway through every open, which surfaced as the panel half-mounting during sign-in.
+- **Service-worker API corruption.** `arc-sidepanel-shim.js` permanently replaced `chrome.tabs.query`, `chrome.tabs.get` and `chrome.storage.local.get` with debug wrappers that dropped every argument after the first, so callback-style calls never got their callback. They're now gated behind the shim's debug flag and forward all arguments.
+
 ---
 
 ## Rebased on Claude for Chrome 1.0.91
@@ -89,7 +98,9 @@ The patch set was previously built on `1.0.66`. It now targets Anthropic's `1.0.
 
 The **tool surface is unchanged** between `1.0.66` and `1.0.91` — the same 22 MCP tools, and `computer` exposes the same action set. `javascript_tool` still routes through `chrome.debugger` → `Runtime.evaluate`, so every fix above remains necessary and applies unmodified.
 
-The APIs the new build actually calls were audited against the shims: `chrome.sidePanel.{open,setOptions,setPanelBehavior}`, `chrome.tabGroups.{Color,TAB_GROUP_ID_NONE,get,query,update}` and `chrome.tabs.{group,ungroup}` are all already covered, so no shim changes were needed.
+The APIs the new build actually calls were audited against the shims: `chrome.sidePanel.{open,setOptions,setPanelBehavior}`, `chrome.tabGroups.{Color,TAB_GROUP_ID_NONE,get,query,update}` and `chrome.tabs.{group,ungroup}` are all already covered, so the polyfills carried over unchanged.
+
+What *did* need work was the new Cowork panel, which is the one genuinely new Arc incompatibility in this release — it assumes a side panel that isn't hosted in a tab. Since 1.0.91 turns it on by default, the fork now opts back into the classic panel.
 
 ---
 

@@ -114,7 +114,8 @@ function _shimLog(hid, msg, data = {}) {
   _shimLog('H3', 'websocket_wrap_ok', {});
 }
 
-{
+// Diagnostics only — these replace the real chrome.debugger methods.
+if (ARC_SHIM_DEBUG) {
   const dbg = chrome.debugger;
   if (dbg) {
     const origAttach = dbg.attach.bind(dbg);
@@ -232,33 +233,36 @@ function _shimLog(hid, msg, data = {}) {
   }).catch(() => {});
 }
 
-{
+// Diagnostics only. These replace real Chrome APIs, so they stay out of the
+// way unless ARC_SHIM_DEBUG is on — and they forward every argument, since
+// callers may pass a callback the promise form doesn't have.
+if (ARC_SHIM_DEBUG) {
   const origQuery = chrome.tabs.query.bind(chrome.tabs);
   const origGet = chrome.tabs.get.bind(chrome.tabs);
   const origStorageGet = chrome.storage.local.get.bind(chrome.storage.local);
   let _toolCallPending = null;
 
-  chrome.tabs.query = function(queryInfo) {
+  chrome.tabs.query = function(queryInfo, ...rest) {
     if (_toolCallPending) {
       _shimLog('H8', 'tabs_query_during_tool', { queryInfo: JSON.stringify(queryInfo)?.slice(0, 100), tool: _toolCallPending });
     }
-    return origQuery(queryInfo);
+    return origQuery(queryInfo, ...rest);
   };
-  chrome.tabs.get = function(tabId) {
+  chrome.tabs.get = function(tabId, ...rest) {
     if (_toolCallPending) {
       _shimLog('H8', 'tabs_get_during_tool', { tabId, tool: _toolCallPending });
     }
-    return origGet(tabId);
+    return origGet(tabId, ...rest);
   };
 
-  chrome.storage.local.get = function(keys) {
+  chrome.storage.local.get = function(keys, ...rest) {
     if (_toolCallPending) {
       const keyStr = typeof keys === 'string' ? keys : Array.isArray(keys) ? keys.join(',') : JSON.stringify(keys)?.slice(0, 80);
-      if (!keyStr.includes('claude_arc_debug_ring')) {
+      if (keyStr && !keyStr.includes('claude_arc_debug_ring')) {
         _shimLog('H9', 'storage_get_during_tool', { keys: keyStr, tool: _toolCallPending });
       }
     }
-    return origStorageGet(keys);
+    return origStorageGet(keys, ...rest);
   };
 
   self._arcToolCallTracker = {
@@ -288,6 +292,19 @@ _shimLog('H15', 'polyfill_decision', {
 if (chrome.sidePanel?.setPanelBehavior) {
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false }).catch(() => {});
 }
+
+// Default to the classic panel rather than the Cowork experience, which
+// defaults on in 1.0.91. Cowork embeds claude.ai in a child iframe, and that
+// page's `get_sidepanel_host_info` request is only answered when the worker
+// sees `sender.tab === undefined` — true of a real side panel, never true
+// here, since this panel always lives in a tab. Without this, Cowork reports
+// "Can't reach the Claude extension" and renders logged out even with valid
+// tokens stored. An explicit choice by the user is left alone.
+chrome.storage.local.get('preferCoworkExperience').then((stored) => {
+  if (stored.preferCoworkExperience === undefined) {
+    return chrome.storage.local.set({ preferCoworkExperience: false });
+  }
+}).catch(() => {});
 const _needsPolyfill = true;
 
 if (_needsPolyfill) {

@@ -108,7 +108,9 @@
     updateSqueezeCSS(0);
   }
 
-  const modifiedFixedElements = new WeakMap();
+  // Map, not WeakMap: restoreFixedElements() iterates and clears this, and
+  // WeakMap supports neither. Entries are dropped on every restore.
+  const modifiedFixedElements = new Map();
 
   const hostEl = document.createElement('div');
   hostEl.id = 'claude-arc-panel-host';
