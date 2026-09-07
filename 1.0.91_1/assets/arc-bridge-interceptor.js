@@ -131,6 +131,38 @@ async function _toCssCoords(tabId, coordinate) {
   return [x, y];
 }
 
+// The model reads coordinates off the image it is shown, so the image has to
+// be small enough that nothing downstream resizes it again. These are the
+// official extension's own limits, and _fitImage is a port of its Se(): keep
+// both sides under maxTargetPx and the (28px cell) token count under budget.
+const _IMG_LIMITS = { pxPerToken: 28, maxTargetPx: 1568, maxTargetTokens: 1568 };
+
+function _imgTokens(w, h, pxPerToken) {
+  const cells = (n) => Math.floor((n - 1) / pxPerToken) + 1;
+  return cells(w) * cells(h);
+}
+
+function _fitImage(w, h, limits = _IMG_LIMITS) {
+  const { pxPerToken, maxTargetPx, maxTargetTokens } = limits;
+  if (w <= maxTargetPx && h <= maxTargetPx && _imgTokens(w, h, pxPerToken) <= maxTargetTokens) {
+    return [w, h];
+  }
+  if (h > w) {
+    const [fh, fw] = _fitImage(h, w, limits);
+    return [fw, fh];
+  }
+  const aspect = w / h;
+  let lo = 1;
+  let hi = w;
+  for (;;) {
+    if (lo + 1 === hi) return [lo, Math.max(Math.round(lo / aspect), 1)];
+    const mid = Math.floor((lo + hi) / 2);
+    const midH = Math.max(Math.round(mid / aspect), 1);
+    if (mid <= maxTargetPx && _imgTokens(mid, midH, pxPerToken) <= maxTargetTokens) lo = mid;
+    else hi = mid;
+  }
+}
+
 const _ZOOM_MAX_SIDE = 1568;
 const _ZOOM_MAX_UPSCALE = 4;
 
@@ -186,9 +218,19 @@ function _pngSize(base64) {
 }
 
 function _pageViewport() {
+  // viewport-override.js runs in the MAIN world and rewrites window.innerWidth
+  // to hide the panel's width from page scripts, so innerWidth read here is
+  // short by exactly that much whenever the panel is squeezing the page. Both
+  // captureVisibleTab and elementFromPoint work in the real, unreduced
+  // viewport, so the reduction has to go back on before any coordinate maths --
+  // otherwise every x is scaled down and clicks land left of their target.
+  const el = document.documentElement;
+  const reduction = (el && parseInt(el.getAttribute('data-claude-vp-width') || '0', 10)) || 0;
+  const inner = window.innerWidth;
   return {
-    w: window.innerWidth,
+    w: inner + reduction,
     h: window.innerHeight,
+    pageW: inner,
     dpr: window.devicePixelRatio || 1
   };
 }
@@ -346,11 +388,28 @@ function _pageEval(code, limit) {
 }
 
 function _pagePointer(x, y, kind) {
-  const el = document.elementFromPoint(x, y);
+  let el = document.elementFromPoint(x, y);
   if (!el) {
     return {
       error: 'No element at (' + Math.round(x) + ', ' + Math.round(y) +
         '). The coordinate may be outside the viewport, or the page may have scrolled since the screenshot.'
+    };
+  }
+
+  // elementFromPoint stops at a shadow host, so a click dispatched there never
+  // reaches the control inside it. Walk down until the point resolves to itself.
+  for (let hops = 0; hops < 10 && el.shadowRoot; hops++) {
+    const inner = el.shadowRoot.elementFromPoint(x, y);
+    if (!inner || inner === el) break;
+    el = inner;
+  }
+
+  const tag = String(el.nodeName).toLowerCase();
+  if (tag === 'iframe' || tag === 'frame') {
+    return {
+      error: 'The element at (' + Math.round(x) + ', ' + Math.round(y) + ') is an <' + tag +
+        '>. Clicks are dispatched in the top frame only, so this one cannot be delivered. ' +
+        'Use javascript_tool inside the frame, or interact with the page outside it.'
     };
   }
 
@@ -403,7 +462,26 @@ function _pagePointer(x, y, kind) {
     } catch (e) {}
   }
 
-  return { ok: kind + ' on ' + describeEl(el) };
+  const ACTIVATABLE = 'a[href], button, input, select, textarea, label, summary, ' +
+    '[role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="checkbox"], ' +
+    '[onclick], [tabindex]';
+  const activation = typeof el.closest === 'function' ? el.closest(ACTIVATABLE) : null;
+  const where = ' at (' + Math.round(x) + ', ' + Math.round(y) + ') on ' + describeEl(el);
+  if (!activation) {
+    const inside = typeof el.querySelector === 'function' ? el.querySelector(ACTIVATABLE) : null;
+    return {
+      ok: kind + where + '. Nothing clickable is at that point or above it, so the page ' +
+        'ignored it' +
+        (inside
+          ? '. There is a ' + describeEl(inside) + ' inside that element but the point missed it — ' +
+            'call read_page and click by ref instead of by coordinate.'
+          : ' — take a fresh screenshot and check the coordinate.')
+    };
+  }
+  return {
+    ok: kind + where +
+      (activation === el ? '' : ' (handled by ' + describeEl(activation) + ')')
+  };
 }
 
 function _pageType(text) {
@@ -608,6 +686,21 @@ function _pageAxTree(filter, depth, maxChars, refId) {
   }
 }
 
+function _pageRefRect(ref) {
+  const map = window.__claudeElementMap;
+  const holder = map && map[ref];
+  const el = holder && typeof holder.deref === 'function' ? holder.deref() : null;
+  if (!el || !document.contains(el)) {
+    return { error: `No element found for ${ref}. It may have been removed — call read_page again.` };
+  }
+  el.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' });
+  const r = el.getBoundingClientRect();
+  if (r.width === 0 && r.height === 0) {
+    return { error: `Element ${ref} has no size on screen, so there is nothing to click.` };
+  }
+  return { ok: { x: r.left + r.width / 2, y: r.top + r.height / 2 } };
+}
+
 function _pageScrollToRef(ref) {
   const map = window.__claudeElementMap;
   const holder = map && map[ref];
@@ -615,6 +708,16 @@ function _pageScrollToRef(ref) {
   if (!el) return { error: `Element ${ref} is not on this page any more. Call read_page again.` };
   el.scrollIntoView({ block: 'center', inline: 'nearest' });
   return { ok: `Scrolled to ${ref}.` };
+}
+
+/** Centre of a read_page ref, from whichever world holds the element map. */
+async function _refPoint(tabId, ref) {
+  let last = null;
+  for (const world of _AXTREE_WORLDS) {
+    last = await _runInTab(tabId, _pageRefRect, [String(ref)], world);
+    if (last && last.ok) return last.ok;
+  }
+  return { error: last?.error || `Could not resolve ${ref}.` };
 }
 
 /** Build the tree, trying each world until one produces it. */
@@ -825,6 +928,16 @@ const TOOL_HANDLERS = {
     if (resolved.error) return _err(resolved.error);
     const targetTabId = resolved.id;
 
+    // Clicks are aimed in screenshot pixels and dispatched in CSS pixels. When a
+    // click misses, the first thing worth knowing is which frames were involved,
+    // so say so rather than making it something to reverse-engineer from ratios.
+    const frameNote = async () => {
+      if (ref) return '';
+      const dims = await _getShotDims(targetTabId);
+      if (!dims?.imgW) return ' [no screenshot on record for this tab; coordinates used as-is]';
+      return ` [screenshot frame ${dims.imgW}x${dims.imgH} -> viewport ${Math.round(dims.cssW)}x${Math.round(dims.cssH)}]`;
+    };
+
     const run = async (func, fnArgs) => {
       let result;
       try {
@@ -839,8 +952,15 @@ const TOOL_HANDLERS = {
     };
 
     const cssCoordinate = async (name) => {
+      // A ref from read_page beats a coordinate: it hits the element's own centre,
+      // so activation lands on the anchor rather than the cell padding around it.
+      if (ref) {
+        const point = await _refPoint(targetTabId, ref);
+        if (point.error) throw new Error(point.error);
+        return [point.x, point.y];
+      }
       if (!Array.isArray(coordinate) || coordinate.length < 2) {
-        throw new Error(`coordinate [x, y] is required for ${name}.`);
+        throw new Error(`coordinate [x, y] or ref is required for ${name}.`);
       }
       return _toCssCoords(targetTabId, coordinate);
     };
@@ -855,23 +975,57 @@ const TOOL_HANDLERS = {
           }
           await new Promise(r => setTimeout(r, 300));
           const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
-          const base64 = dataUrl.replace(/^data:image\/png;base64,/, '');
+          const raw = dataUrl.replace(/^data:image\/png;base64,/, '');
 
-          // Record the image-to-CSS scale so later clicks can translate coordinates.
+          // captureVisibleTab renders at devicePixelRatio, so on a retina display
+          // the PNG is twice the CSS viewport. Sent as-is it gets resized again
+          // before the model sees it, and the coordinates it reads back are then
+          // in a frame nothing here knows about -- clicks land at a fraction of
+          // where they were aimed. Resize here instead, and record the frame.
           const vp = await _runInTab(targetTabId, _pageViewport, []);
-          const size = _pngSize(base64);
-          if (vp && size) {
+          const size = _pngSize(raw);
+          let base64 = raw;
+          let outW = size?.w;
+          let outH = size?.h;
+          if (size) {
+            // Aim at the CSS viewport rather than the largest image the budget
+            // allows. A retina capture fitted to the cap comes out *bigger* than
+            // the viewport, so every coordinate then needs a conversion that buys
+            // nothing. At CSS size the mapping is 1:1 -- what the model reads is
+            // what elementFromPoint gets -- and it only shrinks further when the
+            // viewport itself is too large for the budget.
+            const [fitW, fitH] = _fitImage(
+              Math.min(size.w, Math.round(vp?.w || size.w)),
+              Math.min(size.h, Math.round(vp?.h || size.h))
+            );
+            if (fitW !== size.w || fitH !== size.h) {
+              try {
+                base64 = await _cropPngBase64(raw, 0, 0, size.w, size.h, fitW, fitH);
+                outW = fitW;
+                outH = fitH;
+              } catch (e) {
+                // Fall back to the full-size capture rather than failing outright.
+              }
+            }
+          }
+          if (vp && outW && outH) {
             await _rememberShotDims(targetTabId, {
-              imgW: size.w, imgH: size.h, cssW: vp.w, cssH: vp.h
+              imgW: outW, imgH: outH, cssW: vp.w, cssH: vp.h
             });
           }
 
           _touchSession(targetTabId);
           return {
-            content: [{
-              type: 'image',
-              source: { type: 'base64', media_type: 'image/png', data: base64 }
-            }]
+            content: [
+              {
+                type: 'text',
+                text: `Successfully captured screenshot (${outW}x${outH}, png)`
+              },
+              {
+                type: 'image',
+                source: { type: 'base64', media_type: 'image/png', data: base64 }
+              }
+            ]
           };
         }
 
@@ -887,7 +1041,12 @@ const TOOL_HANDLERS = {
         case 'triple_click':
         case 'hover': {
           const [x, y] = await cssCoordinate(action);
-          return run(_pagePointer, [x, y, action]);
+          const result = await run(_pagePointer, [x, y, action]);
+          if (result.is_error) return result;
+          const note = await frameNote();
+          const block = result.content?.[0];
+          if (note && block) block.text += note;
+          return result;
         }
 
         case 'type': {
@@ -913,7 +1072,7 @@ const TOOL_HANDLERS = {
           } else {
             const vp = await _runInTab(targetTabId, _pageViewport, []);
             if (!vp) return _err('Could not measure the viewport to scroll.');
-            x = vp.w / 2;
+            x = (vp.pageW || vp.w) / 2;
             y = vp.h / 2;
           }
           return run(_pageScroll, [x, y, scroll_direction, scroll_amount]);
@@ -922,6 +1081,9 @@ const TOOL_HANDLERS = {
         case 'left_click_drag': {
           if (!Array.isArray(start_coordinate) || start_coordinate.length < 2) {
             return _err('start_coordinate [x, y] is required for left_click_drag.');
+          }
+          if (!Array.isArray(coordinate) || coordinate.length < 2) {
+            return _err('coordinate [x, y] is required for left_click_drag.');
           }
           const [x0, y0] = await _toCssCoords(targetTabId, start_coordinate);
           const [x1, y1] = await cssCoordinate('left_click_drag');
@@ -994,11 +1156,16 @@ const TOOL_HANDLERS = {
             return _err(`Could not crop the zoomed region: ${e.message || String(e)}`);
           }
 
+          // Record the frame a full screenshot would have used, not the crop's
+          // own size: coordinates for later clicks still come from full shots.
+          const capW = size?.w || Math.round(vp.w * ratio);
+          const capH = size?.h || Math.round(vp.h * ratio);
+          const [frameW, frameH] = _fitImage(
+            Math.min(capW, Math.round(vp.w)),
+            Math.min(capH, Math.round(vp.h))
+          );
           await _rememberShotDims(targetTabId, {
-            imgW: size?.w || Math.round(vp.w * ratio),
-            imgH: size?.h || Math.round(vp.h * ratio),
-            cssW: vp.w,
-            cssH: vp.h
+            imgW: frameW, imgH: frameH, cssW: vp.w, cssH: vp.h
           });
           _touchSession(targetTabId);
 
@@ -1006,9 +1173,10 @@ const TOOL_HANDLERS = {
             content: [
               {
                 type: 'text',
-                text: `Zoomed region (${Math.round(region[0])}, ${Math.round(region[1])}) to ` +
+                text: `Successfully captured zoomed screenshot of region ` +
+                      `(${Math.round(region[0])}, ${Math.round(region[1])}) to ` +
                       `(${Math.round(region[2])}, ${Math.round(region[3])}) - ${dw}x${dh} pixels. ` +
-                      'Coordinates for clicks still come from a full screenshot, not this crop.'
+                      'Click coordinates still come from a full screenshot, not this crop.'
               },
               {
                 type: 'image',

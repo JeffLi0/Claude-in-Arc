@@ -1,119 +1,51 @@
 # Claude in Arc
 
-Anthropic's official **Claude for Chrome** extension, patched to run natively inside **Arc Browser** — with the browser APIs Arc doesn't implement replaced by Arc-compatible equivalents.
+**Anthropic's Claude for Chrome extension, patched to actually work in [Arc Browser](https://arc.net).**
 
-Arc is Chromium-based, but it omits several extension APIs the official Claude extension is built on. The result is an extension that installs cleanly and then quietly half-works: the side panel never opens, and Claude's browser tools hang instead of doing anything. This project fixes that.
 
-**Current release: v0.3**, built on Claude for Chrome `1.0.91`.
-
-> **This is a fork of [chxsong/Claude-in-Arc](https://github.com/chxsong/Claude-in-Arc)**, which did the original work of getting the extension's side panel rendering inside Arc. This fork adds multi-tab session visibility, repairs Claude's page-interaction tools, and rebases the patch set onto Anthropic's current release. See [Credits](#credits).
+> A fork of **[chxsong/Claude-in-Arc](https://github.com/chxsong/Claude-in-Arc)**, which did the original work of getting the panel to render inside Arc. This fork repairs Claude's page-interaction tools, fixes sign-in, and adds a session border. See [Credits](#credits).
 
 ---
 
 ## Installation
 
-Download **`Claude-in-Arc-v0.3.zip`** from [Releases](https://github.com/JeffLi0/Claude-in-Arc/releases) and unzip it. Then in Arc:
+1. Download **`Claude-in-Arc-v0.3.zip`** from [Releases](https://github.com/JeffLi0/Claude-in-Arc/releases) and unzip it
+2. Open `arc://extensions` and turn on **Developer mode**
+3. Click **Load unpacked** and choose the unzipped folder
 
-1. Go to `arc://extensions`
-2. Enable **Developer mode**
-3. Click **Load unpacked** and select the unzipped `1.0.91_1` folder
+Press **⌘E** or click the toolbar icon to open Claude.
 
-The patched build deliberately drops the `update_url` from its manifest, so Arc won't silently auto-update over it and undo the patches. To move to a newer release, download the new ZIP and load it the same way.
+The build deliberately ships without an `update_url`, so Arc can't auto-update over it and undo the patches. To upgrade, download the new ZIP and load it the same way. To remove it, click **Remove Extension** in `arc://extensions`.
 
-### Uninstallation
-
-Go to `arc://extensions` and click **Remove Extension**.
+> After reloading the extension, reload any tabs you already had open. Chromium doesn't re-inject content scripts into existing tabs, so the panel won't open on them until you do.
 
 ---
 
-## The problem
+## What was broken, and how it's fixed
 
-Arc is Chromium-based, but it doesn't implement three of the extension APIs Claude for Chrome is built on — and a fourth assumption breaks simply because of how the panel has to be hosted here:
+Arc doesn't implement three of the extension APIs Claude is built on, and it hosts the panel differently than the extension assumes.
 
-| What's missing | What breaks |
-| --- | --- |
-| `chrome.sidePanel` | The Claude panel never opens |
-| `chrome.tabGroups` | Claude's multi-tab session tracking never resolves, and every tool call naming a tab is rejected as outside Claude's tab group |
-| `chrome.debugger` | Clicking, typing, scrolling and JavaScript execution hang until the request times out |
-| A real side panel | The Cowork panel refuses to authenticate, reporting *"Can't reach the Claude extension"* despite a valid session |
+| What's missing | What broke | Fix |
+| --- | --- | --- |
+| `chrome.sidePanel` | The panel never opened | Renders as an injected iframe beside the page |
+| `chrome.debugger` | Every click, keystroke and script hung until it timed out | Tool calls are intercepted and re-run on `chrome.scripting`, which Arc supports |
+| `chrome.tabGroups` | Tool calls were rejected as *"not in Claude's tab group"* | Tab confinement can't exist in Arc, so it's switched off |
+| A real side panel | Sign-in reported *"Can't reach the Claude extension"* despite valid tokens | Defaults back to the classic panel, which doesn't need one |
 
-The `chrome.debugger` case is the nastiest, because it doesn't fail — it *stalls*. The official extension drives every page interaction through the Chrome Debugger Protocol, and in Arc the `attach` call never settles. No error is raised and no result is ever returned, so the only symptom is a timeout several seconds later: *"the tool did not respond in time."*
+The `chrome.debugger` gap is the one that matters. The official extension drives every page interaction through the Chrome Debugger Protocol, and in Arc the `attach` call never settles — no error, no result, just a timeout. [`arc-bridge-interceptor.js`](1.0.91_1/assets/arc-bridge-interceptor.js) catches those calls as they arrive over the bridge WebSocket and reimplements them on `chrome.scripting.executeScript`: clicks and keystrokes as synthesized DOM events, `read_page` by injecting Anthropic's own accessibility-tree builder, `zoom` by cropping the screenshot in the service worker with `OffscreenCanvas`.
 
-The tab-group case fails in a more confusing way. The official extension confines Claude's tools to a Chrome tab group, and checks each call by comparing the target tab's `groupId` against the group it created for the session. Arc has neither half of that, so the group is never established and no tab ever carries its id — every call naming a tab comes back with *"Tab N is not in Claude's tab group for this session."*
-
-The last row is subtler still. Since Arc has no side panel, this fork renders `sidepanel.html` inside a tab. The Cowork experience embeds claude.ai in a child iframe, and the service worker only answers that page's `get_sidepanel_host_info` request when it sees `sender.tab === undefined` — its test for "am I hosted in a real side panel?" A tab-hosted panel can never satisfy it, so sign-in appears to fail even though the OAuth exchange succeeded and the tokens were stored correctly.
+Screenshots are resized to match the CSS viewport before they're sent, so a coordinate read off the image is a coordinate on the page — no conversion, and none of the drift that comes with one.
 
 ---
 
-## What this fork adds
+## Session border
 
-### Page interaction actually works
-
-`assets/arc-bridge-interceptor.js` intercepts Claude's tool calls as they arrive over the bridge WebSocket and re-implements them on `chrome.scripting.executeScript`, which Arc does support.
-
-- **`javascript_tool`** — evaluates in the page's `MAIN` world, falling back to the `ISOLATED` world (same DOM, different CSP) when a page blocks `eval`. Supports top-level `await` by compiling the snippet into an async function body and rewriting the trailing expression into a `return`, so the last expression still comes back as the result. Output is depth-limited, safe against circular references, and redacts credential-shaped keys and values.
-- **`computer`** — `left_click`, `right_click`, `double_click`, `triple_click`, `hover`, `type`, `key`, `scroll`, `left_click_drag`, `scroll_to` and `wait` are synthesized as real DOM events. Typing goes through the prototype `value` setter so React and similar frameworks register the change. `screenshot` records the captured image's dimensions against the CSS viewport, so click coordinates read off a retina screenshot are scaled correctly instead of landing at double their intended position.
-
-- **`zoom`** — the official action clips `Page.captureScreenshot` through the debugger. Here the viewport is captured whole and the region cropped in the service worker with `OffscreenCanvas`, then scaled up to 4× (capped at 1568 px a side) so small regions are actually legible. Decoding goes through a `Blob` rather than `fetch(dataUrl)`, which the extension CSP would refuse.
-- **`read_page` and `find`** — both depend on `window.__generateAccessibilityTree`, and through the official executor they return *"Page script returned empty result"* in Arc. They now inject Anthropic's own tree builder and call it directly, in the `MAIN` world first and `ISOLATED` as fallback. `read_page` is the real thing, refs included, which is also what makes `scroll_to` work. `find` is not: the official one asks a small model to pick elements out of the tree, and that inference isn't reachable from the worker, so this build matches the query literally against the tree and returns the lines it hit. The output says so, rather than quietly pretending to be the semantic finder.
-
-### Session border
-
-Because `chrome.tabGroups` never resolves in Arc, there was no way to tell which tabs Claude was working across. This fork adds a parallel, Arc-only tracker:
-
-- **`assets/arc-session-border.js`** — draws an orange band (`#d97757`, Claude's brand color) inside any tab that's part of the current session. The band is square against the viewport edge, since Arc clips and rounds the web content's outer corners itself, and rounded on its inner edge to sit correctly inside that curve.
-- **`assets/arc-session-tracker.js`** — service-worker-side state, backed by `chrome.storage.session` so it survives the MV3 worker being killed and restarted. A tab joins the session when its panel is open, or when a tool call touches it; touched-but-not-open tabs expire after 10 minutes.
-
-Wired into `claude-panel-injector.js` (panel open/close), `arc-bridge-interceptor.js` (bridge tool calls) and `arc-adapter.js` (tab commands).
-
-**Worth knowing:** tools answered by the interceptor don't go through Anthropic's per-site permission manager, because that state lives inside the official executor this path replaces. Claude's global browser-control consent still applies, but the extra per-domain *can use / not allowed on* gate doesn't run for `javascript_tool`, `computer`, `read_page`, `find`, `get_page_text` or `navigate` in this build.
-
-**Known limitation:** tool calls arriving over the native-messaging transport (the local Claude Desktop app) bypass the interceptor and go straight to the official executor, so a *new* tab opened mid-task through that path won't be bordered. The anchor tab — wherever the panel is open — is always bordered regardless of transport.
-
-### Sign-in, tool routing and panel fixes
-
-- **Tool calls rejected as "not in Claude's tab group".** Tab confinement can't be represented in Arc (see [The problem](#the-problem)), so it's off in this build: `getTabForMcp` and the equivalent check in `tabs_close_mcp` no longer compare the target tab's group. The tab must still exist. Nothing is lost that Arc could otherwise enforce — the interceptor ignores groups outright, and `tabs_context_mcp` lists every ordinary tab — but Claude is no longer restricted to a subset of your tabs, so it can act on any tab it's given. This is the fork's one patch to an official bundle, `assets/mcpPermissions-CMuwfoXg.js`; it's applied there rather than in a shim because the same module also runs in the panel, where no shim has loaded.
-- **Duplicate tool results.** The interceptor listened for bridge messages alongside the official handler rather than in place of it, so an intercepted call was answered twice for one `tool_use_id` — and the official reply, which fails instantly in Arc, usually arrived first. Intercepted calls are now hidden from the official `onmessage` handler, and are matched against this device's own bridge id so a call meant for Claude Desktop is left alone.
-- **"Permission denied by user" without a prompt.** Per-site permission prompts opened as a popup window (`chrome.windows.create({type:"popup"})`). Arc dismisses extension popups on its own, so nobody ever saw the prompt and its 30-second timeout resolved as a denial. The prompt now opens as a tab, which is how this fork renders the panel anyway.
-- **Classic panel by default.** 1.0.91 defaults `preferCoworkExperience` to on, and Cowork can't authenticate in a tab-hosted panel (see [The problem](#the-problem)). The worker now defaults it off, leaving an explicit user choice untouched.
-- **Panel crash on open.** `claude-panel-injector.js` tracked the fixed/sticky elements it repositions in a `WeakMap`, then called `.entries()` and `.clear()` on it — both `Map`-only methods. `showPanel` threw partway through every open, which surfaced as the panel half-mounting during sign-in.
-- **Service-worker API corruption.** `arc-sidepanel-shim.js` permanently replaced `chrome.tabs.query`, `chrome.tabs.get` and `chrome.storage.local.get` with debug wrappers that dropped every argument after the first, so callback-style calls never got their callback. They're now gated behind the shim's debug flag and forward all arguments.
-
----
-
-## Rebased on Claude for Chrome 1.0.91
-
-The patch set was previously built on `1.0.66`. It now targets Anthropic's `1.0.91` release, which adds a substantial amount:
-
-- **Claude Cowork in the side panel** — an opt-in replacement for the classic chat that embeds the claude.ai Cowork interface, extending Claude from browser tabs to working across your folders.
-- **Plan mode and autonomy controls** — Claude can propose a plan and follow it, or run without pausing for approval.
-- **Memories** — Claude creates, reads and edits persistent memories across sessions.
-- **Artifacts in the panel** — artifact view, per-artifact consent for shared-data access, and org-level controls.
-- **Per-site permissions** — explicit *can use* / *asking to use* / *not allowed on* states per host, a site-permission manager, and enterprise policy blocking.
-- **Scheduled tasks** with completion notifications, **saved prompts / shortcuts**, and **skills**.
-- **Richer action reporting** — batch progress, and per-action status for every tool.
-- Mermaid diagrams, code execution and file creation, file previews, conflicting-extension detection, and localization expanded from 3 to 11 locales.
-
-### What that meant for the port
-
-The **tool surface is unchanged** between `1.0.66` and `1.0.91` — the same 22 MCP tools, and `computer` exposes the same action set. `javascript_tool` still routes through `chrome.debugger` → `Runtime.evaluate`, so every fix above remains necessary and applies unmodified.
-
-The APIs the new build actually calls were audited against the shims: `chrome.sidePanel.{open,setOptions,setPanelBehavior}`, `chrome.tabGroups.{Color,TAB_GROUP_ID_NONE,get,query,update}` and `chrome.tabs.{group,ungroup}` are all already covered, so the polyfills carried over unchanged.
-
-What *did* need work was the new Cowork panel, which is the one genuinely new Arc incompatibility in this release — it assumes a side panel that isn't hosted in a tab. Since 1.0.91 turns it on by default, the fork now opts back into the classic panel.
-
----
-
-## Inherited from upstream
-
-- **View Mode** — switch the panel between Squeeze (default) and Overlay (iFrame) injection.
-- **Claude Desktop integration** over native messaging.
-- The `chrome.sidePanel` polyfill (`assets/arc-sidepanel-shim.js`) that makes the panel render at all.
+Arc has no tab groups, so there was no way to see which tabs Claude was working across. Tabs in the current session get a thin orange band drawn inside them ([`arc-session-border.js`](1.0.91_1/assets/arc-session-border.js)), tracked in the service worker and stored in `chrome.storage.session` so it survives the worker restarting. Tabs Claude merely touched expire after 10 minutes; the tab with the panel open stays marked.
 
 ---
 
 ## Credits
 
-- **Anthropic** — the original Claude for Chrome extension that all of this patches.
-- **[chxsong/Claude-in-Arc](https://github.com/chxsong/Claude-in-Arc)** — the upstream project, which established the side-panel injection approach and the Arc patching toolkit this fork builds on.
-- This fork adds the session tracker/border, the debugger-free interaction tools, and the 1.0.91 rebase described above.
+- **[Anthropic](https://claude.ai)** — Claude for Chrome, the extension all of this patches.
+- **[chxsong/Claude-in-Arc](https://github.com/chxsong/Claude-in-Arc)** — the upstream project, which established the panel-injection approach this fork builds on.
+- This fork adds the debugger-free interaction tools, the session border, and the sign-in and tool-routing fixes above.
