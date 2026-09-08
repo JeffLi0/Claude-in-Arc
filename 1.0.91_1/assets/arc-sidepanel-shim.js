@@ -52,6 +52,21 @@ function _shimLog(hid, msg, data = {}) {
     // the interceptor must scope itself the same way.
     let localDeviceId = null;
 
+    // Tool calls were dispatched the moment they arrived, so two that overlap
+    // ran concurrently and could finish out of order. For a typed sequence that
+    // is the difference between "saw" and "swa", and an Enter can overtake the
+    // text it was meant to submit. Run them one at a time.
+    let _queueTail = Promise.resolve();
+    const _enqueue = (fn) => {
+      const run = _queueTail.then(fn, fn);
+      // A wedged handler must not block everything behind it forever.
+      _queueTail = Promise.race([
+        run.catch(() => {}),
+        new Promise(resolve => setTimeout(resolve, 60000))
+      ]);
+      return run;
+    };
+
     const shouldIntercept = (parsed) => {
       if (!parsed || parsed.type !== 'tool_call') return false;
       if (parsed.target_device_id && parsed.target_device_id !== localDeviceId) return false;
@@ -94,7 +109,7 @@ function _shimLog(hid, msg, data = {}) {
             _shimLog('INTERCEPT', 'dispatching_tool_call', {
               tool: parsed.tool, tool_use_id: parsed.tool_use_id
             });
-            self._arcBridgeInterceptor.handleBridgeToolCall(parsed, origSend)
+            _enqueue(() => self._arcBridgeInterceptor.handleBridgeToolCall(parsed, origSend))
               .then(() => {
                 _shimLog('INTERCEPT', 'tool_call_completed', {
                   tool: parsed.tool, tool_use_id: parsed.tool_use_id

@@ -8,7 +8,7 @@
  * them here via self._arcBridgeInterceptor.handleBridgeToolCall().
  */
 
-const _INTERCEPTOR_VERSION = '0.3.0';
+const _INTERCEPTOR_VERSION = '0.7.0';
 const _MAX_PAGE_TEXT = 50000;
 const _STORAGE_KEY = 'claude_arc_mcp_group';
 
@@ -55,6 +55,29 @@ function _touchSession(tabId) {
   try { self._arcSessionTracker?.touch(tabId); } catch (e) {}
 }
 
+// The tab Claude is working in, so browsing can reuse it instead of either
+// taking over the user's current tab or piling up a new one per navigation.
+const _OWN_TAB_KEY = 'claude_arc_own_tab';
+
+async function _rememberOwnTab(tabId) {
+  try {
+    await chrome.storage.session.set({ [_OWN_TAB_KEY]: tabId });
+  } catch (e) {}
+}
+
+async function _getOwnTab() {
+  try {
+    const r = await chrome.storage.session.get(_OWN_TAB_KEY);
+    const id = r[_OWN_TAB_KEY];
+    if (typeof id !== 'number') return null;
+    await chrome.tabs.get(id);
+    return id;
+  } catch (e) {
+    // Closed since we last used it.
+    return null;
+  }
+}
+
 async function _resolveTabId(tabId) {
   const id = typeof tabId === 'number' ? tabId : await _getActiveTabId();
   if (!id) return { error: 'No tab available.' };
@@ -84,15 +107,75 @@ const _EVAL_OUTPUT_LIMIT = 51200;
 const _SHOT_DIMS_KEY = 'claude_arc_shot_dims';
 const _MAX_WAIT_SECONDS = 10;
 
-async function _runInTab(tabId, func, args, world = 'MAIN') {
+async function _runInFrame(tabId, frameId, func, args, world = 'MAIN') {
   const [res] = await chrome.scripting.executeScript({
-    target: { tabId },
+    target: frameId ? { tabId, frameIds: [frameId] } : { tabId },
     world,
     func,
     args
   });
   return res?.result;
 }
+
+async function _runInTab(tabId, func, args, world = 'MAIN') {
+  return _runInFrame(tabId, 0, func, args, world);
+}
+
+// A click that lands in a cross-origin iframe has to be re-injected into that
+// frame, which means turning the <iframe> element the top frame saw into a
+// frameId. Pair webNavigation's parent/child structure with a per-frame probe
+// for size, so a frame can be identified by its position in the tree even when
+// several embeds share a URL.
+async function _frameTree(tabId) {
+  let nav = [];
+  try {
+    nav = (await chrome.webNavigation.getAllFrames({ tabId })) || [];
+  } catch (e) {
+    return [];
+  }
+  let probes = [];
+  try {
+    probes = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: 'MAIN',
+      func: () => ({ href: location.href, w: innerWidth, h: innerHeight })
+    });
+  } catch (e) {
+    probes = [];
+  }
+  const sizes = new Map();
+  for (const pr of probes) {
+    if (pr && pr.result) sizes.set(pr.frameId, pr.result);
+  }
+  return nav.map(f => Object.assign(
+    { frameId: f.frameId, parentFrameId: f.parentFrameId, url: f.url },
+    sizes.get(f.frameId) || {}
+  ));
+}
+
+/** Pick the child frame matching the <iframe> the pointer walk stopped on. */
+function _matchFrame(frames, parentFrameId, want) {
+  let pool = frames.filter(f => f.parentFrameId === parentFrameId);
+  if (!pool.length) pool = frames.filter(f => f.frameId !== parentFrameId);
+  if (!pool.length) return null;
+  if (pool.length === 1) return pool[0].frameId;
+
+  const byUrl = want.url
+    ? pool.filter(f => f.url === want.url || f.href === want.url)
+    : [];
+  if (byUrl.length === 1) return byUrl[0].frameId;
+
+  // innerWidth counts the scrollbar that the element's clientWidth excludes, so
+  // this has to tolerate more than a rounding error.
+  const near = (a, b) => typeof a === 'number' && Math.abs(a - b) <= 18;
+  const bySize = (byUrl.length ? byUrl : pool)
+    .filter(f => near(f.w, want.w) && near(f.h, want.h));
+  return bySize.length === 1 ? bySize[0].frameId : null;
+}
+
+// Where the last click landed, so a follow-up type/key reaches the field it
+// focused rather than the top document.
+const _LAST_FRAME = new Map();
 
 async function _rememberShotDims(tabId, dims) {
   try {
@@ -187,7 +270,8 @@ function _bytesToB64(bytes) {
  * Decoding goes through a Blob rather than fetch(dataUrl) so nothing touches
  * connect-src, which the extension CSP would refuse.
  */
-async function _cropPngBase64(base64, sx, sy, sw, sh, dw, dh) {
+async function _cropPngBase64(base64, sx, sy, sw, sh, dw, dh, opts) {
+  const type = opts?.type || 'image/png';
   const blob = new Blob([_b64ToBytes(base64)], { type: 'image/png' });
   const bitmap = await createImageBitmap(blob);
   try {
@@ -196,9 +280,69 @@ async function _cropPngBase64(base64, sx, sy, sw, sh, dw, dh) {
     if (!ctx) throw new Error('OffscreenCanvas 2d context unavailable.');
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
+    if (type !== 'image/png') {
+      // JPEG carries no alpha, so anything the capture left transparent would
+      // come out black. Lay down the page's own white first.
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, dw, dh);
+    }
     ctx.drawImage(bitmap, sx, sy, sw, sh, 0, 0, dw, dh);
-    const outBlob = await canvas.convertToBlob({ type: 'image/png' });
+    const outBlob = await canvas.convertToBlob(
+      type === 'image/png' ? { type } : { type, quality: opts?.quality ?? 0.85 }
+    );
     return _bytesToB64(new Uint8Array(await outBlob.arrayBuffer()));
+  } finally {
+    bitmap.close();
+  }
+}
+
+// The bridge refuses any tool result over 1MB and the image is nearly all of
+// it, so budget the base64 -- that is the form that gets counted -- and leave
+// headroom for the JSON around it. Fitting the token budget is not enough on
+// its own: a screenshot of a dense page is well inside 1568px and still encodes
+// past a megabyte as PNG.
+const _MAX_IMAGE_B64 = 700000;
+
+const _ENCODE_LADDER = [
+  { type: 'image/png' },
+  { type: 'image/jpeg', quality: 0.85 },
+  { type: 'image/jpeg', quality: 0.6 }
+];
+
+/**
+ * Encode a capture at the requested size, then keep degrading until it fits
+ * the result cap: PNG first, then JPEG at falling quality, then smaller
+ * dimensions. Returns the frame it settled on, because coordinates map
+ * proportionally off the recorded frame -- a shrunk image is still clickable
+ * as long as the caller records what came back.
+ */
+async function _encodeWithinBudget(raw, sx, sy, sw, sh, dw, dh) {
+  let w = Math.max(1, Math.round(dw));
+  let h = Math.max(1, Math.round(dh));
+  for (;;) {
+    for (const opt of _ENCODE_LADDER) {
+      const data = await _cropPngBase64(raw, sx, sy, sw, sh, w, h, opt);
+      if (data.length <= _MAX_IMAGE_B64) {
+        return { data, mediaType: opt.type, w, h };
+      }
+    }
+    if (w <= 400 || h <= 400) {
+      throw new Error('capture will not fit the 1MB result limit even at minimum size');
+    }
+    w = Math.max(1, Math.round(w * 0.75));
+    h = Math.max(1, Math.round(h * 0.75));
+  }
+}
+
+/** PNG dimensions, falling back to a decode when the header can't be read. */
+async function _imageSize(base64) {
+  const header = _pngSize(base64);
+  if (header) return header;
+  const bitmap = await createImageBitmap(
+    new Blob([_b64ToBytes(base64)], { type: 'image/png' })
+  );
+  try {
+    return { w: bitmap.width, h: bitmap.height };
   } finally {
     bitmap.close();
   }
@@ -388,7 +532,9 @@ function _pageEval(code, limit) {
 }
 
 function _pagePointer(x, y, kind) {
-  let el = document.elementFromPoint(x, y);
+  let doc = document;
+  let win = window;
+  let el = doc.elementFromPoint(x, y);
   if (!el) {
     return {
       error: 'No element at (' + Math.round(x) + ', ' + Math.round(y) +
@@ -396,20 +542,46 @@ function _pagePointer(x, y, kind) {
     };
   }
 
-  // elementFromPoint stops at a shadow host, so a click dispatched there never
-  // reaches the control inside it. Walk down until the point resolves to itself.
-  for (let hops = 0; hops < 10 && el.shadowRoot; hops++) {
-    const inner = el.shadowRoot.elementFromPoint(x, y);
-    if (!inner || inner === el) break;
-    el = inner;
-  }
+  // elementFromPoint stops at whatever hosts the real target -- a shadow host or
+  // an iframe -- so a click dispatched there never reaches the control. Keep
+  // descending: into shadow roots directly, and into same-origin frames by
+  // switching document. A cross-origin frame can't be reached from here, so hand
+  // the caller what it needs to re-inject into that frame instead.
+  for (let hops = 0; hops < 12; hops++) {
+    if (el.shadowRoot) {
+      const inner = el.shadowRoot.elementFromPoint(x, y);
+      if (inner && inner !== el) { el = inner; continue; }
+    }
+    const tag = String(el.nodeName).toLowerCase();
+    if (tag !== 'iframe' && tag !== 'frame') break;
 
-  const tag = String(el.nodeName).toLowerCase();
-  if (tag === 'iframe' || tag === 'frame') {
+    // The frame's content origin, not its border box: a bordered or padded
+    // iframe would otherwise shift every coordinate inside it.
+    const rect = el.getBoundingClientRect();
+    let ox = rect.left;
+    let oy = rect.top;
+    try {
+      const cs = win.getComputedStyle(el);
+      ox += (parseFloat(cs.borderLeftWidth) || 0) + (parseFloat(cs.paddingLeft) || 0);
+      oy += (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.paddingTop) || 0);
+    } catch (e) {}
+    const fx = x - ox;
+    const fy = y - oy;
+
+    let childDoc = null;
+    try { childDoc = el.contentDocument; } catch (e) { childDoc = null; }
+    if (childDoc && typeof childDoc.elementFromPoint === 'function') {
+      const inner = childDoc.elementFromPoint(fx, fy);
+      if (!inner) break;
+      doc = childDoc;
+      win = el.contentWindow || win;
+      el = inner;
+      x = fx;
+      y = fy;
+      continue;
+    }
     return {
-      error: 'The element at (' + Math.round(x) + ', ' + Math.round(y) + ') is an <' + tag +
-        '>. Clicks are dispatched in the top frame only, so this one cannot be delivered. ' +
-        'Use javascript_tool inside the frame, or interact with the page outside it.'
+      frame: { url: el.src || '', x: fx, y: fy, w: el.clientWidth, h: el.clientHeight }
     };
   }
 
@@ -421,7 +593,7 @@ function _pagePointer(x, y, kind) {
 
   const isRight = kind === 'right_click';
   const base = {
-    bubbles: true, cancelable: true, composed: true, view: window,
+    bubbles: true, cancelable: true, composed: true, view: win,
     clientX: x, clientY: y, screenX: x, screenY: y,
     button: isRight ? 2 : 0, buttons: isRight ? 2 : 1
   };
@@ -444,8 +616,45 @@ function _pagePointer(x, y, kind) {
   for (let i = 1; i <= clicks; i++) {
     pointer('pointerdown', { detail: i });
     mouse('mousedown', { detail: i });
-    if (i === 1 && typeof el.focus === 'function') {
-      try { el.focus({ preventScroll: true }); } catch (e) { try { el.focus(); } catch (e2) {} }
+    if (i === 1) {
+      // Focus the thing that can hold focus, not the leaf the point landed on.
+      // Inside a rich editor that leaf is usually a <span>, and focusing it does
+      // nothing -- the editable host never becomes activeElement, so every
+      // keystroke afterwards goes to the body.
+      const FOCUSABLE = 'input, textarea, select, button, a[href], ' +
+        '[contenteditable=""], [contenteditable="true"], [tabindex]';
+      const target = (typeof el.closest === 'function' && el.closest(FOCUSABLE)) || el;
+      if (typeof target.focus === 'function') {
+        try { target.focus({ preventScroll: true }); } catch (e) {
+          try { target.focus(); } catch (e2) {}
+        }
+      }
+      // A real click also places the caret, and editors built on a model --
+      // Slate, ProseMirror, Quill -- derive their internal selection from the
+      // DOM selection. Without one they have nowhere to apply an edit: text can
+      // still land in the DOM while the model stays empty, so the editor
+      // serialises nothing and the visible text is discarded.
+      if (target.isContentEditable) {
+        try {
+          let range = null;
+          if (typeof doc.caretRangeFromPoint === 'function') {
+            range = doc.caretRangeFromPoint(x, y);
+          } else if (typeof doc.caretPositionFromPoint === 'function') {
+            const pos = doc.caretPositionFromPoint(x, y);
+            if (pos) {
+              range = doc.createRange();
+              range.setStart(pos.offsetNode, pos.offset);
+              range.collapse(true);
+            }
+          }
+          const sel = win.getSelection ? win.getSelection() : doc.getSelection();
+          if (range && sel) { sel.removeAllRanges(); sel.addRange(range); }
+          else if (sel && typeof sel.collapse === 'function') {
+            // No caret at that exact point (padding, say) -- land in the host.
+            try { sel.collapse(target, target.childNodes.length); } catch (e) {}
+          }
+        } catch (e) {}
+      }
     }
     pointer('pointerup', { detail: i });
     mouse('mouseup', { detail: i });
@@ -457,14 +666,20 @@ function _pagePointer(x, y, kind) {
   // Synthetic clicks don't carry the native text selection a triple-click makes.
   if (kind === 'triple_click') {
     try {
-      const sel = document.getSelection();
+      const sel = doc.getSelection();
       if (sel) { sel.removeAllRanges(); sel.selectAllChildren(el); }
     } catch (e) {}
   }
 
+  // A rich-text editor is a contenteditable <div>, which matched nothing here,
+  // so clicking Discord's or Notion's composer reported "nothing clickable" even
+  // though the click had landed and focused it.
   const ACTIVATABLE = 'a[href], button, input, select, textarea, label, summary, ' +
+    '[contenteditable=""], [contenteditable="true"], ' +
     '[role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="checkbox"], ' +
-    '[onclick], [tabindex]';
+    '[role="textbox"], [role="searchbox"], [role="combobox"], [role="switch"], ' +
+    '[role="radio"], [role="option"], [role="menuitemcheckbox"], [role="menuitemradio"], ' +
+    '[role="treeitem"], [onclick], [tabindex]';
   const activation = typeof el.closest === 'function' ? el.closest(ACTIVATABLE) : null;
   const where = ' at (' + Math.round(x) + ', ' + Math.round(y) + ') on ' + describeEl(el);
   if (!activation) {
@@ -485,38 +700,115 @@ function _pagePointer(x, y, kind) {
 }
 
 function _pageType(text) {
-  const el = document.activeElement;
+  const el = document.activeElement || document.body;
   const tag = el && el.tagName ? el.tagName.toLowerCase() : '';
   const isField = tag === 'input' || tag === 'textarea';
-  if (!el || (!isField && !el.isContentEditable)) {
-    return { error: 'No text field is focused. Click the field first, then type.' };
-  }
+  const editable = isField || !!(el && el.isContentEditable);
+  if (!el) return { error: 'The page has no focused element to type into.' };
 
-  if (isField) {
-    const proto = tag === 'textarea'
-      ? window.HTMLTextAreaElement.prototype
-      : window.HTMLInputElement.prototype;
-    // Frameworks like React shadow the instance `value` setter to track edits;
-    // going through the prototype setter keeps their state in sync.
-    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-    const start = typeof el.selectionStart === 'number' ? el.selectionStart : el.value.length;
-    const end = typeof el.selectionEnd === 'number' ? el.selectionEnd : el.value.length;
-    const next = el.value.slice(0, start) + text + el.value.slice(end);
+  // Not every target is a field. Games, editors and shortcut layers capture
+  // keystrokes off the document and keep their own state, so refusing to type
+  // without a field made those unreachable -- the keys are the whole point
+  // there, and there is simply nothing to insert into.
 
+  // Frameworks like React shadow the instance `value` setter to track edits;
+  // going through the prototype setter keeps their state in sync.
+  const proto = isField
+    ? (tag === 'textarea' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype)
+    : null;
+  const desc = proto ? Object.getOwnPropertyDescriptor(proto, 'value') : null;
+
+  // Not every input type supports selection -- number, email and colour raise
+  // on read rather than returning null -- so a failure here means "append".
+  const caret = () => {
+    try {
+      const s = el.selectionStart;
+      const e = el.selectionEnd;
+      if (typeof s === 'number' && typeof e === 'number') return [s, e];
+    } catch (err) {}
+    return [el.value.length, el.value.length];
+  };
+
+  const insert = (chunk) => {
+    if (!editable) return false;
+    if (!isField) return document.execCommand('insertText', false, chunk);
+    const [start, end] = caret();
+    const next = el.value.slice(0, start) + chunk + el.value.slice(end);
     el.dispatchEvent(new InputEvent('beforeinput', {
-      bubbles: true, cancelable: true, composed: true, inputType: 'insertText', data: text
+      bubbles: true, cancelable: true, composed: true, inputType: 'insertText', data: chunk
     }));
     if (desc && desc.set) desc.set.call(el, next); else el.value = next;
-    try { el.setSelectionRange(start + text.length, start + text.length); } catch (e) {}
+    try { el.setSelectionRange(start + chunk.length, start + chunk.length); } catch (err) {}
     el.dispatchEvent(new InputEvent('input', {
-      bubbles: true, composed: true, inputType: 'insertText', data: text
+      bubbles: true, composed: true, inputType: 'insertText', data: chunk
     }));
-    el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-    return { ok: 'Typed ' + text.length + ' characters into <' + tag + '>' };
+    return true;
+  };
+
+  // Real typing is a key event per character, and a lot of UI is built on that
+  // rather than on `input`: autocompletes, search-as-you-type, input masks,
+  // character counters, single-key shortcuts. Setting `value` in one shot fires
+  // none of it, so the field fills in and nothing downstream reacts. Replay the
+  // per-character sequence, up to a length where the event traffic stops paying
+  // for itself.
+  // KeyboardEvent's constructor defaults keyCode/charCode to 0, and anything
+  // that captures raw keystrokes instead of hosting a field -- games, editors,
+  // shortcut layers -- still identifies letters by keyCode. A 0 reads as "no
+  // key" and gets dropped, which is why arrows worked (matched by name) and
+  // letters silently did not. Chrome accepts these as legacy init members.
+  const physical = (ch) => {
+    if (/^[a-zA-Z]$/.test(ch)) return ch.toUpperCase().charCodeAt(0);
+    if (/^[0-9]$/.test(ch)) return ch.charCodeAt(0);
+    if (ch === ' ') return 32;
+    return ch.charCodeAt(0) || 0;
+  };
+
+  const chars = Array.from(text);
+  if (chars.length <= 250 || !editable) {
+    for (const ch of chars) {
+      const kc = physical(ch);
+      const init = {
+        key: ch,
+        code: /^[a-zA-Z]$/.test(ch) ? 'Key' + ch.toUpperCase()
+          : /^[0-9]$/.test(ch) ? 'Digit' + ch
+          : ch === ' ' ? 'Space' : '',
+        bubbles: true, cancelable: true, composed: true, view: window,
+        shiftKey: /^[A-Z]$/.test(ch),
+        keyCode: kc, charCode: 0, which: kc
+      };
+      const allowed = el.dispatchEvent(new KeyboardEvent('keydown', init));
+      // Real typing fires keypress between keydown and the edit, carrying the
+      // character's own code rather than the physical key's.
+      if (allowed) {
+        const cc = ch.charCodeAt(0);
+        el.dispatchEvent(new KeyboardEvent('keypress', Object.assign(
+          {}, init, { keyCode: cc, charCode: cc, which: cc }
+        )));
+      }
+      // A plain field calling preventDefault is rejecting the character, the
+      // same as it would a real keystroke -- a digits-only mask, say. Rich
+      // editors also preventDefault, but then insert through their own logic,
+      // which a synthetic event won't reach; there, honouring it would type
+      // nothing at all.
+      if (allowed || !isField) insert(ch);
+      el.dispatchEvent(new KeyboardEvent('keyup', init));
+    }
+  } else {
+    insert(text);
   }
 
-  document.execCommand('insertText', false, text);
-  return { ok: 'Typed ' + text.length + ' characters into a contenteditable element' };
+  if (isField) el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+  if (editable) {
+    return {
+      ok: 'Typed ' + chars.length + ' characters into ' +
+        (isField ? '<' + tag + '>' : 'a contenteditable element')
+    };
+  }
+  return {
+    ok: 'Sent ' + chars.length + ' keystrokes to <' + tag + '>. No text field is focused, ' +
+      'so nothing was inserted directly. A page with its own keystroke capture receives input ' + 
+      'this way; otherwise click a field first and check the result.'
+  };
 }
 
 function _pageKey(combo) {
@@ -529,17 +821,20 @@ function _pageKey(combo) {
     home: 'Home', end: 'End'
   };
 
-  const parts = String(combo).split('+').map(p => p.trim().toLowerCase()).filter(Boolean);
+  // Keep the token's own case: lowercasing everything turned Shift+A into 'a'.
+  const raw = String(combo).split('+').map(p => p.trim()).filter(Boolean);
   const mods = { ctrlKey: false, metaKey: false, altKey: false, shiftKey: false };
   let keyName = null;
-  for (const p of parts) {
+  for (const token of raw) {
+    const p = token.toLowerCase();
     if (p === 'ctrl' || p === 'control') mods.ctrlKey = true;
     else if (p === 'cmd' || p === 'meta' || p === 'command') mods.metaKey = true;
     else if (p === 'alt' || p === 'option') mods.altKey = true;
     else if (p === 'shift') mods.shiftKey = true;
-    else keyName = NAMES[p] || (p.length === 1 ? p : p.charAt(0).toUpperCase() + p.slice(1));
+    else keyName = NAMES[p] || (token.length === 1 ? token : p.charAt(0).toUpperCase() + p.slice(1));
   }
   if (!keyName) return { error: 'No key found in "' + combo + '".' };
+  if (mods.shiftKey && /^[a-z]$/.test(keyName)) keyName = keyName.toUpperCase();
 
   const el = document.activeElement || document.body;
   let code = keyName;
@@ -548,8 +843,25 @@ function _pageKey(combo) {
     else if (/[0-9]/.test(keyName)) code = 'Digit' + keyName;
     else if (keyName === ' ') code = 'Space';
   }
+
+  // Without these the event carries keyCode 0, and anything identifying keys
+  // the legacy way -- games and editors that capture keystrokes rather than
+  // host a field -- discards it. Chrome honours them as init members.
+  const CODES = {
+    Enter: 13, Tab: 9, Backspace: 8, Delete: 46, Escape: 27, ' ': 32,
+    ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39,
+    PageUp: 33, PageDown: 34, Home: 36, End: 35
+  };
+  let keyCode = CODES[keyName] || 0;
+  if (!keyCode && keyName.length === 1) {
+    keyCode = /^[a-z]$/i.test(keyName)
+      ? keyName.toUpperCase().charCodeAt(0)
+      : keyName.charCodeAt(0);
+  }
+
   const init = Object.assign({
-    key: keyName, code, bubbles: true, cancelable: true, composed: true, view: window
+    key: keyName, code, bubbles: true, cancelable: true, composed: true, view: window,
+    keyCode, charCode: 0, which: keyCode
   }, mods);
 
   const notPrevented = el.dispatchEvent(new KeyboardEvent('keydown', init));
@@ -558,9 +870,41 @@ function _pageKey(combo) {
   const tag = (el.tagName || '').toLowerCase();
   const isField = tag === 'input' || tag === 'textarea';
   if (notPrevented) {
+    const printable = keyName.length === 1 && !mods.ctrlKey && !mods.metaKey && !mods.altKey;
     if ((mods.metaKey || mods.ctrlKey) && String(keyName).toLowerCase() === 'a') {
       if (isField && typeof el.select === 'function') el.select();
       else { try { document.getSelection()?.selectAllChildren(el); } catch (e) {} }
+    } else if (printable) {
+      // keypress carries the character's code, not the physical key's.
+      const cc = keyName.charCodeAt(0);
+      el.dispatchEvent(new KeyboardEvent('keypress', Object.assign(
+        {}, init, { keyCode: cc, charCode: cc, which: cc }
+      )));
+      // Only modifiers and editing keys were ever applied, so a bare character
+      // fired keydown/keyup and inserted nothing: `key: "a"` reported success
+      // and left the field empty. `space` did the same.
+      if (isField) {
+        let s = el.value.length;
+        let e = s;
+        try {
+          if (typeof el.selectionStart === 'number') {
+            s = el.selectionStart;
+            e = el.selectionEnd;
+          }
+        } catch (err) {}
+        const proto = tag === 'textarea'
+          ? window.HTMLTextAreaElement.prototype
+          : window.HTMLInputElement.prototype;
+        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+        const next = el.value.slice(0, s) + keyName + el.value.slice(e);
+        if (desc && desc.set) desc.set.call(el, next); else el.value = next;
+        try { el.setSelectionRange(s + 1, s + 1); } catch (err) {}
+        el.dispatchEvent(new InputEvent('input', {
+          bubbles: true, composed: true, inputType: 'insertText', data: keyName
+        }));
+      } else if (el.isContentEditable) {
+        document.execCommand('insertText', false, keyName);
+      }
     } else if (isField && (keyName === 'Backspace' || keyName === 'Delete')) {
       const s = el.selectionStart;
       const e = el.selectionEnd;
@@ -746,6 +1090,7 @@ const TOOL_HANDLERS = {
     const tabs = await _queryUserTabs();
     if (tabs.length === 0 && createIfEmpty) {
       const newTab = await chrome.tabs.create({ active: false, url: 'about:blank' });
+      await _rememberOwnTab(newTab.id);
       return _buildTabContext(newTab.id);
     }
     const activeId = await _getActiveTabId();
@@ -754,6 +1099,7 @@ const TOOL_HANDLERS = {
 
   async tabs_create_mcp(_args) {
     const newTab = await chrome.tabs.create({ active: false, url: 'about:blank' });
+    await _rememberOwnTab(newTab.id);
     _touchSession(newTab.id);
     return _buildTabContext(newTab.id);
   },
@@ -768,7 +1114,17 @@ const TOOL_HANDLERS = {
     } catch {
       return _err(`Tab ${tabId} does not exist.`);
     }
+    // Read the record before removing: _getOwnTab verifies the tab still
+    // exists, so afterwards it could never match.
+    let own = null;
+    try {
+      const r = await chrome.storage.session.get(_OWN_TAB_KEY);
+      own = r[_OWN_TAB_KEY];
+    } catch (e) {}
     await chrome.tabs.remove(tabId);
+    if (own === tabId) {
+      try { await chrome.storage.session.remove(_OWN_TAB_KEY); } catch (e) {}
+    }
     return _buildTabContext(await _getActiveTabId());
   },
 
@@ -777,11 +1133,17 @@ const TOOL_HANDLERS = {
     if (!url) return _err('url is required.');
     let targetTabId = tabId;
     if (typeof targetTabId !== 'number') {
-      targetTabId = await _getActiveTabId();
-      if (!targetTabId) {
+      // With no tab named, this used to take whatever the user had in front of
+      // them and navigate it away. Reuse the tab Claude already works in, and
+      // otherwise open one -- so browsing never replaces the page being read.
+      // Passing an explicit tabId still targets that tab, which is how a
+      // deliberate "navigate this tab" is expressed.
+      targetTabId = await _getOwnTab();
+      if (targetTabId == null) {
         const t = await chrome.tabs.create({ url, active: true });
+        await _rememberOwnTab(t.id);
         _touchSession(t.id);
-        return _ok(`Navigated new tab ${t.id} to ${url}`);
+        return _ok(`Opened new tab ${t.id} at ${url}`);
       }
     }
     try {
@@ -789,6 +1151,9 @@ const TOOL_HANDLERS = {
     } catch {
       return _err(`Tab ${targetTabId} does not exist.`);
     }
+    // Deliberately not recorded as Claude's tab: an explicit tabId is a one-off
+    // instruction to navigate that tab, and adopting it would mean every later
+    // implicit navigation took over the user's tab too.
     await chrome.tabs.update(targetTabId, { url });
     if (force !== false) {
       await chrome.tabs.update(targetTabId, { active: true });
@@ -951,6 +1316,62 @@ const TOOL_HANDLERS = {
       return _ok(result.ok);
     };
 
+    // Dispatch a pointer event, following the coordinate down through nested
+    // frames until it reaches the document that actually owns the target.
+    const pointerInFrames = async (x, y, kind) => {
+      let frameId = 0;
+      let fx = x;
+      let fy = y;
+      let frames = null;
+      for (let hop = 0; hop < 4; hop++) {
+        let r;
+        try {
+          r = await _runInFrame(targetTabId, frameId, _pagePointer, [fx, fy, kind]);
+        } catch (e) {
+          return _err(`${kind} failed: ${e.message}`);
+        }
+        if (!r) return _err(`${kind} returned no result.`);
+        if (!r.frame) {
+          _touchSession(targetTabId);
+          _LAST_FRAME.set(targetTabId, frameId);
+          if (r.error) return _err(r.error);
+          return _ok(frameId ? `${r.ok} [inside frame ${frameId}]` : r.ok);
+        }
+        if (!frames) frames = await _frameTree(targetTabId);
+        const next = _matchFrame(frames, frameId, r.frame);
+        if (next == null) {
+          return _err(
+            `The element at (${Math.round(x)}, ${Math.round(y)}) is inside a cross-origin ` +
+            `<iframe>${r.frame.url ? ` (${r.frame.url})` : ''} that could not be matched to a ` +
+            'live frame. Use javascript_tool, or interact with the page outside the frame.'
+          );
+        }
+        frameId = next;
+        fx = r.frame.x;
+        fy = r.frame.y;
+      }
+      return _err('Gave up after 4 nested frames without reaching a clickable element.');
+    };
+
+    // Typing follows the click: focus lives in whichever frame was last clicked,
+    // and the top document's activeElement would just be the <iframe>.
+    const runFocused = async (func, fnArgs) => {
+      const frameId = _LAST_FRAME.get(targetTabId) || 0;
+      if (!frameId) return run(func, fnArgs);
+      let result;
+      try {
+        result = await _runInFrame(targetTabId, frameId, func, fnArgs);
+      } catch (e) {
+        // The frame navigated or went away; fall back to the top document.
+        _LAST_FRAME.delete(targetTabId);
+        return run(func, fnArgs);
+      }
+      if (!result) return _err(`${action} returned no result.`);
+      _touchSession(targetTabId);
+      if (result.error) return _err(result.error);
+      return _ok(result.ok);
+    };
+
     const cssCoordinate = async (name) => {
       // A ref from read_page beats a coordinate: it hits the element's own centre,
       // so activation lands on the anchor rather than the cell padding around it.
@@ -983,8 +1404,9 @@ const TOOL_HANDLERS = {
           // in a frame nothing here knows about -- clicks land at a fraction of
           // where they were aimed. Resize here instead, and record the frame.
           const vp = await _runInTab(targetTabId, _pageViewport, []);
-          const size = _pngSize(raw);
+          const size = await _imageSize(raw).catch(() => null);
           let base64 = raw;
+          let mediaType = 'image/png';
           let outW = size?.w;
           let outH = size?.h;
           if (size) {
@@ -998,13 +1420,31 @@ const TOOL_HANDLERS = {
               Math.min(size.w, Math.round(vp?.w || size.w)),
               Math.min(size.h, Math.round(vp?.h || size.h))
             );
-            if (fitW !== size.w || fitH !== size.h) {
+            // `scale` (0.1-1) shrinks further, matching the official tool. The
+            // model reaches for it the moment a result comes back too large, so
+            // it has to actually do something -- ignoring it left the retry
+            // failing exactly like the call before it.
+            const n = Number(scale);
+            const shrink = Number.isFinite(n) && n >= 0.1 && n <= 1 ? n : 1;
+            const wantW = Math.max(1, Math.round(fitW * shrink));
+            const wantH = Math.max(1, Math.round(fitH * shrink));
+            const resized = wantW !== size.w || wantH !== size.h;
+            if (resized || raw.length > _MAX_IMAGE_B64) {
               try {
-                base64 = await _cropPngBase64(raw, 0, 0, size.w, size.h, fitW, fitH);
-                outW = fitW;
-                outH = fitH;
+                const enc = await _encodeWithinBudget(
+                  raw, 0, 0, size.w, size.h, wantW, wantH
+                );
+                base64 = enc.data;
+                mediaType = enc.mediaType;
+                outW = enc.w;
+                outH = enc.h;
               } catch (e) {
-                // Fall back to the full-size capture rather than failing outright.
+                if (raw.length > _MAX_IMAGE_B64) {
+                  return _err(
+                    `Could not encode the screenshot small enough to return: ${e.message || String(e)}`
+                  );
+                }
+                // Otherwise the untouched capture is still a valid answer.
               }
             }
           }
@@ -1019,11 +1459,11 @@ const TOOL_HANDLERS = {
             content: [
               {
                 type: 'text',
-                text: `Successfully captured screenshot (${outW}x${outH}, png)`
+                text: `Successfully captured screenshot (${outW}x${outH}, ${mediaType === 'image/png' ? 'png' : 'jpeg'})`
               },
               {
                 type: 'image',
-                source: { type: 'base64', media_type: 'image/png', data: base64 }
+                source: { type: 'base64', media_type: mediaType, data: base64 }
               }
             ]
           };
@@ -1041,7 +1481,7 @@ const TOOL_HANDLERS = {
         case 'triple_click':
         case 'hover': {
           const [x, y] = await cssCoordinate(action);
-          const result = await run(_pagePointer, [x, y, action]);
+          const result = await pointerInFrames(x, y, action);
           if (result.is_error) return result;
           const note = await frameNote();
           const block = result.content?.[0];
@@ -1051,14 +1491,14 @@ const TOOL_HANDLERS = {
 
         case 'type': {
           if (!text) return _err('text is required for the type action.');
-          return run(_pageType, [String(text)]);
+          return runFocused(_pageType, [String(text)]);
         }
 
         case 'key': {
           if (!text) return _err('text is required for the key action.');
           let last = null;
           for (const key of String(text).trim().split(/\s+/)) {
-            last = await run(_pageKey, [key]);
+            last = await runFocused(_pageKey, [key]);
             if (last.is_error) return last;
           }
           return last;
@@ -1150,8 +1590,15 @@ const TOOL_HANDLERS = {
           const dh = Math.max(1, Math.round(sh * factor));
 
           let cropped;
+          let cropType = 'image/png';
+          let cropW = dw;
+          let cropH = dh;
           try {
-            cropped = await _cropPngBase64(shot, sx, sy, sw, sh, dw, dh);
+            const enc = await _encodeWithinBudget(shot, sx, sy, sw, sh, dw, dh);
+            cropped = enc.data;
+            cropType = enc.mediaType;
+            cropW = enc.w;
+            cropH = enc.h;
           } catch (e) {
             return _err(`Could not crop the zoomed region: ${e.message || String(e)}`);
           }
@@ -1164,9 +1611,14 @@ const TOOL_HANDLERS = {
             Math.min(capW, Math.round(vp.w)),
             Math.min(capH, Math.round(vp.h))
           );
-          await _rememberShotDims(targetTabId, {
-            imgW: frameW, imgH: frameH, cssW: vp.w, cssH: vp.h
-          });
+          // Only when nothing is on record: a real screenshot may have been
+          // shrunk to fit the size cap, and overwriting its frame with this
+          // hypothetical one would misplace clicks aimed off that image.
+          if (!(await _getShotDims(targetTabId))?.imgW) {
+            await _rememberShotDims(targetTabId, {
+              imgW: frameW, imgH: frameH, cssW: vp.w, cssH: vp.h
+            });
+          }
           _touchSession(targetTabId);
 
           return {
@@ -1175,12 +1627,12 @@ const TOOL_HANDLERS = {
                 type: 'text',
                 text: `Successfully captured zoomed screenshot of region ` +
                       `(${Math.round(region[0])}, ${Math.round(region[1])}) to ` +
-                      `(${Math.round(region[2])}, ${Math.round(region[3])}) - ${dw}x${dh} pixels. ` +
+                      `(${Math.round(region[2])}, ${Math.round(region[3])}) - ${cropW}x${cropH} pixels. ` +
                       'Click coordinates still come from a full screenshot, not this crop.'
               },
               {
                 type: 'image',
-                source: { type: 'base64', media_type: 'image/png', data: cropped }
+                source: { type: 'base64', media_type: cropType, data: cropped }
               }
             ]
           };
