@@ -158,9 +158,12 @@ async function _reinjectContentScripts() {
 }
 
 chrome.runtime.onInstalled.addListener(async ({ reason }) => {
-  if (reason === 'install' && !_IS_DEV_BUILD) {
-    chrome.tabs.create({ url: chrome.runtime.getURL('arc-setup.html') });
-    return;
+  if (reason !== 'install' && reason !== 'update') return;
+  // Loading the folder over an earlier copy of this extension (same ID)
+  // counts as an update, not an install, so ask until a folder is chosen.
+  if (!_IS_DEV_BUILD) {
+    const { arc_update_folder_chosen: chosen } = await chrome.storage.local.get('arc_update_folder_chosen');
+    if (!chosen) chrome.tabs.create({ url: chrome.runtime.getURL('arc-setup.html') });
   }
   if (reason !== 'update') return;
   await _reinjectContentScripts();

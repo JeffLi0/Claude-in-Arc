@@ -51,6 +51,7 @@ goButton.addEventListener('click', async () => {
         return;
       }
       await arcSetExtensionDir(dir);
+      await chrome.storage.local.set({ arc_update_folder_chosen: true });
     }
     await finish();
   } catch (e) {
