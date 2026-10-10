@@ -11,19 +11,21 @@
 
 1. Download **`Claude-in-Arc-<version>.zip`** from the [latest release](https://github.com/JeffLi0/Claude-in-Arc/releases/latest) and unzip it somewhere permanent, such as your Documents folder
 2. Open `arc://extensions`, turn on **Developer mode**, click **Load unpacked**, and choose the unzipped `Claude-in-Arc` folder
-3. A setup tab opens. Click **Choose folder** and pick that same `Claude-in-Arc` folder, so the extension can update itself
+3. A tab asks *Keep Claude in Arc up to date?* Click **Turn on automatic updates**, pick that same `Claude-in-Arc` folder, and click **Select**. (An extension can't find out which folder it was loaded from, so this is the one thing it has to ask.)
 
 Press **⌘E** or click the toolbar icon to open Claude. To remove it, click **Remove Extension** in `arc://extensions` and delete the folder.
 
 ## Staying up to date
 
-There's nothing to do. Every release is the official Claude in Chrome build of the same version number with the Arc patches applied on top, and it reaches you on its own:
+Usually there's nothing to do. Every release is the official Claude in Chrome build of the same version number with the Arc patches applied on top, and it reaches you on its own:
 
-- **Releases are automatic.** A GitHub Action checks the Chrome Web Store every six hours and publishes a new release when Anthropic ships one, or refreshes the current one when the patches change.
-- **The extension updates its own folder.** Every six hours it checks for a newer release and writes it into the folder you chose during setup.
+- **Releases are automatic.** A GitHub Action checks the Chrome Web Store every day and publishes a new release when Anthropic ships one, or refreshes the current one when the patches change.
+- **The extension updates its own folder.** Once a day it checks for a newer release and writes it into the folder you picked.
 - **It reloads when nothing is happening.** The new version takes over once you've been away from the computer for 30 minutes and no Claude task has run for 15, so a panel or a running task is never cut off. It then re-attaches to the tabs you already had open. Your sign-in and settings are kept, because the extension ID doesn't change.
 
-If Arc forgets the folder permission, which can happen after a restart, you'll get a notification and a **!** on the toolbar icon. Click the notification, then **Allow updates**.
+Arc lets an extension write to its folder only while one of its pages is open, so when an update is ready after Arc has dropped that access, you'll get a notification: *A Claude in Arc update is ready*. Click it, then **Install update**; the folder window opens at the right folder, so just click **Select**. If you chose **Not now** during setup, it won't ask again; open `chrome-extension://fcoeoabgfenejglbffodgkkbkcdhcgfn/arc-setup.html` to turn updates on later.
+
+**Several Arc profiles?** Load the folder in each one; each runs its own copy and shows up as a separate browser for Claude Desktop and Claude Code. The first time one of them asks you to connect, give each profile its own name. The prompt shows a few of that profile's open tabs, so you can tell them apart even when Arc shows two prompts side by side.
 
 The model list is set by Anthropic for your claude.ai account and fetched by the extension at runtime, so it's the same list Chrome shows. This repo doesn't choose it.
 
@@ -35,7 +37,7 @@ Arc can't update an unpacked extension the usual way. The build has no `update_u
 python3 scripts/build.py          # latest upstream -> dist/Claude-in-Arc
 ```
 
-Load `dist/Claude-in-Arc` once. Local builds never download releases over your work. Re-run the script to update: the extension picks up the rebuilt folder the next time you're away, or click reload in `arc://extensions` to apply it now. It needs only Python 3 and `curl`.
+Load `dist/Claude-in-Arc` once, in as many Arc profiles as you like, and pick that folder when it asks to keep itself up to date. A local build keeps itself current with Anthropic too: it's replaced by the GitHub release only when Anthropic ships a newer Claude in Chrome, never over a build of the same version, so your rebuilds aren't overwritten. After you edit `arc/` or `scripts/`, re-run the script: every profile with the folder loaded switches to the new build within a minute or two, as soon as no Claude task is running. Click reload in `arc://extensions` to apply it immediately. It needs only Python 3 and `curl`.
 
 ---
 

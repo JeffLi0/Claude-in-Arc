@@ -57,6 +57,7 @@ SW_AFTER = [
     "arc-zoom-handler.js",
     "arc-adapter.js",
     "arc-update-check.js",
+    "arc-bridge-name.js",
 ]
 
 CONTENT_SCRIPTS = [
@@ -216,8 +217,8 @@ def build_id():
     if os.environ.get("GITHUB_SHA"):
         return sha
     # Local builds may carry uncommitted patches, so they always get a new id.
-    # ".dev." also tells arc-update-check.js never to replace this build with
-    # a downloaded release.
+    # ".dev." tells arc-update-check.js to replace this build with a release
+    # only once Anthropic has shipped a newer upstream version.
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
     return f"dev.{sha or 'nogit'}.{stamp}"
 
@@ -293,6 +294,21 @@ def patch_sidepanel_html(out):
     write(path, html)
 
 
+def patch_pairing_html(out):
+    # Each Arc profile opens its own "wants to connect" prompt, and Arc can show
+    # them together; label each with its profile's tabs.
+    path = os.path.join(out, "pairing.html")
+    html, n = re.subn(
+        r"(\s*)</body>",
+        r'\1  <script src="/assets/arc-pairing-profile.js"></script>\1</body>',
+        read(path),
+        count=1,
+    )
+    if n != 1:
+        raise SystemExit("pairing.html no longer has the expected structure")
+    write(path, html)
+
+
 def patch_offscreen_html(out):
     # The updater writes files from here: it needs a window context, and
     # upstream already keeps this document around.
@@ -344,6 +360,21 @@ def verify(out):
 
 
 def build(crx_bytes, out):
+    # Build beside the folder and swap it in at the end. Arc may have `out`
+    # loaded in several profiles, and each reloads itself when the build on
+    # disk changes; it should never catch a half-written folder.
+    staging = out + ".building"
+    version = build_into(crx_bytes, staging)
+    previous = out + ".previous"
+    shutil.rmtree(previous, ignore_errors=True)
+    if os.path.isdir(out):
+        os.rename(out, previous)
+    os.rename(staging, out)
+    shutil.rmtree(previous, ignore_errors=True)
+    return version
+
+
+def build_into(crx_bytes, out):
     extract(crx_to_zip(crx_bytes), out)
     version = patch_manifest(out)
     log(f"Upstream version {version}")
@@ -351,10 +382,16 @@ def build(crx_bytes, out):
         if f.endswith(".js"):
             shutil.copy2(os.path.join(ARC_DIR, f), os.path.join(out, "assets", f))
         elif f.endswith(".html"):
-            shutil.copy2(os.path.join(ARC_DIR, f), os.path.join(out, f))
+            html = read(os.path.join(ARC_DIR, f))
+            # Upstream's font files are content-hashed; point at this release's.
+            fonts = glob.glob(os.path.join(out, "assets", "AnthropicSans-Roman-Variable-*.woff2"))
+            if fonts:
+                html = html.replace("__ANTHROPIC_SANS__", os.path.basename(fonts[0]))
+            write(os.path.join(out, f), html)
     patch_service_worker_loader(out)
     patch_sidepanel_html(out)
     patch_offscreen_html(out)
+    patch_pairing_html(out)
     apply_bundle_patches(out)
     verify(out)
     return version

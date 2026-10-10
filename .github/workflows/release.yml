@@ -1,11 +1,11 @@
-# Rebuilds Claude in Arc whenever Anthropic ships a new Claude in Chrome, and
-# whenever the Arc patches change. A failed run means an upstream release
+# Rebuilds Claude in Arc whenever Anthropic ships a new Claude in Chrome (checked
+# daily), and whenever the Arc patches change. A failed run means an upstream release
 # moved code a patch depends on; GitHub emails the repo owner about it.
 name: Release
 
 on:
   schedule:
-    - cron: "17 */6 * * *"
+    - cron: "17 6 * * *"
   workflow_dispatch:
   push:
     branches: [main]
@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: release
@@ -23,6 +24,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # GitHub pauses scheduled workflows after 60 days without commits, and
+      # the releases this publishes don't count. Re-enabling the workflow does,
+      # so the daily check never lapses and no keepalive commits are needed.
+      # It runs first so a failing build can't skip it.
+      - name: Keep the schedule alive
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/release.yml/enable"
 
       - name: Check upstream version
         id: upstream

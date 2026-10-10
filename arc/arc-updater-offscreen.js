@@ -63,11 +63,27 @@ function _arcWriteOrder(path) {
   return 1;
 }
 
+function _arcIsNewerVersion(a, b) {
+  const pa = String(a).split('.').map(Number);
+  const pb = String(b).split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+  }
+  return false;
+}
+
+// Whether `installed` (a manifest) already counts as `release`. A local
+// development build always differs from the release, so it's only replaced
+// once Anthropic has shipped a newer Claude in Chrome; until then it's the
+// developer's own, newer work.
+function _arcIsUpToDate(installed, release) {
+  if (installed.version_name === release.version_name) return true;
+  return /\.dev\./.test(installed.version_name || '') && !_arcIsNewerVersion(release.version, installed.version);
+}
+
 async function _arcApplyUpdate(url) {
   const dir = await arcGetExtensionDir();
   if (!dir) return { status: 'no-folder' };
-  if ((await dir.queryPermission({ mode: 'readwrite' })) !== 'granted') return { status: 'needs-permission' };
-  if (!(await arcIsThisExtension(dir))) return { status: 'wrong-folder' };
 
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Download failed: ${res.status}`);
@@ -80,10 +96,21 @@ async function _arcApplyUpdate(url) {
   if (!manifestBytes) throw new Error('Release has no manifest.json');
   const manifest = JSON.parse(new TextDecoder().decode(manifestBytes));
   if (manifest.key !== chrome.runtime.getManifest().key) throw new Error('Release is for a different extension');
+  const current = { status: 'current', files: [...files.keys()], versionName: manifest.version_name };
 
-  // The folder on disk, not the running build, is what a write would replace.
+  // Decide whether there's anything to install before touching the folder, so
+  // a lapsed folder permission only matters (and only asks the user) when an
+  // update is actually waiting.
+  if (_arcIsUpToDate(chrome.runtime.getManifest(), manifest)) return current;
+
+  const permission = await dir.queryPermission({ mode: 'readwrite' });
+  if (permission !== 'granted') return { status: 'needs-permission', permission };
+  // Unreadable throws, which reaches the caller as a quiet 'error'.
+  if (!(await arcIsThisExtension(dir))) return { status: 'wrong-folder' };
+  // The folder on disk, not the running build, is what a write would replace;
+  // it may already hold this release, waiting for a reload.
   const onDisk = JSON.parse(await (await (await dir.getFileHandle('manifest.json')).getFile()).text());
-  if (onDisk.version_name === manifest.version_name) return { status: 'current', files: [...files.keys()] };
+  if (_arcIsUpToDate(onDisk, manifest)) return current;
 
   const paths = [...files.keys()].sort((a, b) => _arcWriteOrder(a) - _arcWriteOrder(b));
   for (const path of paths) await _arcWriteFile(dir, path, files.get(path));
@@ -95,7 +122,7 @@ async function _arcApplyUpdate(url) {
 async function _arcCleanup(keep) {
   const dir = await arcGetExtensionDir();
   if (!dir || (await dir.queryPermission({ mode: 'readwrite' })) !== 'granted') return { status: 'skipped' };
-  if (!(await arcIsThisExtension(dir))) return { status: 'wrong-folder' };
+  if (!(await arcIsThisExtension(dir).catch(() => false))) return { status: 'wrong-folder' };
   const keepSet = new Set(keep);
   let removed = 0;
   async function walk(handle, prefix) {
@@ -110,7 +137,9 @@ async function _arcCleanup(keep) {
   return { status: 'cleaned', removed };
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+// arc-setup.html loads this file for _arcApplyUpdate too, but only the
+// offscreen document answers the service worker.
+if (location.pathname === '/offscreen.html') chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === 'ARC_APPLY_UPDATE') {
     _arcApplyUpdate(msg.url).then(sendResponse, (e) => sendResponse({ status: 'error', error: String(e) }));
     return true;

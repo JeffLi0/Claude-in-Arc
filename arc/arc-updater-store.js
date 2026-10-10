@@ -38,11 +38,9 @@ async function arcSetExtensionDir(handle) {
 }
 
 // True when `dir` holds this extension: same manifest key means same ID.
+// Throws when the manifest can't be read right now (mid-write, say), which
+// callers treat as "try again later", not as the wrong folder.
 async function arcIsThisExtension(dir) {
-  try {
-    const file = await (await dir.getFileHandle('manifest.json')).getFile();
-    return JSON.parse(await file.text()).key === chrome.runtime.getManifest().key;
-  } catch (e) {
-    return false;
-  }
+  const file = await (await dir.getFileHandle('manifest.json')).getFile();
+  return JSON.parse(await file.text()).key === chrome.runtime.getManifest().key;
 }
