@@ -58,6 +58,7 @@ SW_AFTER = [
     "arc-adapter.js",
     "arc-update-check.js",
     "arc-bridge-name.js",
+    "arc-pairing-space.js",
 ]
 
 CONTENT_SCRIPTS = [
@@ -97,6 +98,26 @@ BUNDLE_PATCHES = [
         "assets/mcpPermissions-*.js",
         r"if\((\w+\.groupId!==\w+)\)return\{error:`Tab \$\{",
         r"if(/*ARC PATCH: no tab groups in Arc*/!1&&\1)return{error:`Tab ${",
+    ),
+    (
+        # browser_batch checks each step's tab with isTabInSameGroup, so a
+        # batch could touch just one tab. Group ids mean nothing in Arc (a tab
+        # can even carry one from a tabs.group call that never finished), so
+        # any tab that exists qualifies; both tabs.get calls must still succeed.
+        "tab-group check (batch)",
+        "assets/mcpPermissions-*.js",
+        r"return (\w+)\.groupId===chrome\.tabGroups\.TAB_GROUP_ID_NONE\?\w+===\w+:\w+\.groupId===\w+\.groupId\}",
+        r"return/*ARC PATCH: no tab groups in Arc*/!0}",
+    ),
+    (
+        # Every Arc profile gets the "wants to connect" request and opens its
+        # prompt in whatever space is on screen, so they all pile up there.
+        # Hand the prompt to arc-pairing-space.js, which opens it only while
+        # its own profile's space is the one showing.
+        "pairing prompt in its own space",
+        "assets/service-worker.ts-*.js",
+        r"(const (\w+)=chrome\.runtime\.getURL\(`pairing\.html\?request_id=[^`]*`\);)chrome\.tabs\.create\(\{url:\2\}\)",
+        r"\1/*ARC PATCH: open in this profile's space*/self._arcOpenPairing?self._arcOpenPairing(\2):chrome.tabs.create({url:\2})",
     ),
     (
         # The Cowork panel embeds claude.ai in an iframe and relies on the

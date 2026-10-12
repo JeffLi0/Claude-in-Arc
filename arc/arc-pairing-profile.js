@@ -28,4 +28,12 @@
     banner.append(label, titles.length ? titles.join(' · ') : 'no open web pages');
     document.body.append(banner);
   }).catch(() => {});
+
+  // Nothing tells this profile that you connected through another one, so
+  // close once Claude has stopped waiting (arc-pairing-space.js sets this).
+  const deadline = Number(new URLSearchParams(location.search).get('arc_deadline'));
+  if (deadline) {
+    setTimeout(() => chrome.tabs.getCurrent((tab) => { if (tab?.id) chrome.tabs.remove(tab.id); }),
+      Math.max(0, deadline - Date.now()));
+  }
 })();

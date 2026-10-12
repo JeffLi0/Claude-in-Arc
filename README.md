@@ -25,7 +25,7 @@ Usually there's nothing to do. Every release is the official Claude in Chrome bu
 
 Arc lets an extension write to its folder only while one of its pages is open, so when an update is ready after Arc has dropped that access, you'll get a notification: *A Claude in Arc update is ready*. Click it, then **Install update**; the folder window opens at the right folder, so just click **Select**. If you chose **Not now** during setup, it won't ask again; open `chrome-extension://fcoeoabgfenejglbffodgkkbkcdhcgfn/arc-setup.html` to turn updates on later.
 
-**Several Arc profiles?** Load the folder in each one; each runs its own copy and shows up as a separate browser for Claude Desktop and Claude Code. The first time one of them asks you to connect, give each profile its own name. The prompt shows a few of that profile's open tabs, so you can tell them apart even when Arc shows two prompts side by side.
+**Several Arc profiles?** Load the folder in each one; each runs its own copy and shows up as a separate browser for Claude Desktop and Claude Code. When Claude asks which browser to use, each profile's "wants to connect" prompt opens in that profile's own space: you see the one for the space you're in, and switching spaces brings up the other. Click Connect in the one you want; the rest close by themselves after two minutes. Each prompt also lists a few of its profile's tabs, for the rare case where Arc shows two together. Tabs Claude opens appear in whichever space is on screen, since Arc gives extensions no way to switch spaces, but they still belong to the profile you picked, with its accounts.
 
 The model list is set by Anthropic for your claude.ai account and fetched by the extension at runtime, so it's the same list Chrome shows. This repo doesn't choose it.
 
@@ -43,18 +43,15 @@ Load `dist/Claude-in-Arc` once, in as many Arc profiles as you like, and pick th
 
 ## What was broken, and how it's fixed
 
-Arc doesn't implement three of the extension APIs Claude is built on, and it hosts the panel differently than the extension assumes.
+Arc doesn't implement two of the extension APIs Claude is built on, and it hosts the panel differently than the extension assumes.
 
 | What's missing | What broke | Fix |
 | --- | --- | --- |
 | `chrome.sidePanel` | The panel never opened | Renders as an injected iframe beside the page |
-| `chrome.debugger` | Every click, keystroke and script hung until it timed out | Tool calls are intercepted and re-run on `chrome.scripting`, which Arc supports |
-| `chrome.tabGroups` | Tool calls were rejected as *"not in Claude's tab group"* | Tab confinement can't exist in Arc, so it's switched off |
+| `chrome.tabGroups` | Tool calls were rejected as *"not in Claude's tab group"*, and opening a tab for Claude hung | Tab confinement can't exist in Arc, so it's switched off, and [`arc-bridge-interceptor.js`](arc/arc-bridge-interceptor.js) answers the tab tools without groups |
 | A real side panel | Sign-in reported *"Can't reach the Claude extension"* despite valid tokens | Defaults back to the classic panel, which doesn't need one |
 
-The `chrome.debugger` gap is the one that matters. The official extension drives every page interaction through the Chrome Debugger Protocol, and in Arc the `attach` call never settles — no error, no result, just a timeout. [`arc-bridge-interceptor.js`](arc/arc-bridge-interceptor.js) catches those calls as they arrive over the bridge WebSocket and reimplements them on `chrome.scripting.executeScript`: clicks and keystrokes as synthesized DOM events, `read_page` by injecting Anthropic's own accessibility-tree builder, `zoom` by cropping the screenshot in the service worker with `OffscreenCanvas`.
-
-Screenshots are resized to match the CSS viewport before they're sent, so a coordinate read off the image is a coordinate on the page — no conversion, and none of the drift that comes with one.
+Clicks, typing, screenshots, `find`, `read_page` and JavaScript all run on Anthropic's own code. Older Arc releases never let `chrome.debugger` attach, and this fork used to reimplement those tools without it; current Arc does, so they now work as they do in Chrome, site permissions included.
 
 ---
 
@@ -65,13 +62,14 @@ The repo stores only the Arc patches, never a copy of Anthropic's extension. [`s
 1. It downloads the current release from the Chrome Web Store.
 2. It copies the scripts in [`arc/`](arc/) into the extension.
 3. It loads those scripts through the manifest, the service-worker loader and `sidepanel.html`.
-4. It makes seven small edits to Anthropic's minified code. Each edit is marked with an `ARC PATCH` comment:
+4. It makes nine small edits to Anthropic's minified code. Each edit is marked with an `ARC PATCH` comment:
 
 | Edit | Why |
 | --- | --- |
-| Turns off the two tab-group checks on tool calls | Arc has no tab groups, so these checks can only reject |
+| Turns off the three tab-group checks on tool calls | Arc has no tab groups, so these checks can only reject |
 | Keeps the classic panel instead of the new claude.ai-embedded one | The embed needs claude.ai's cookies, which Arc partitions away inside the injected panel, so it always shows *"Sign in to Claude"* |
 | Tags onboarding prompts with their tab, and has panels ignore other tabs' prompts | Hidden panels stay loaded in other tabs, and one of them could take the "Start challenge" prompt, leaving the new panel empty |
+| Hands the "wants to connect" prompt to [`arc-pairing-space.js`](arc/arc-pairing-space.js) | Arc opens every profile's prompt in the space on screen; this opens each in its own profile's space |
 | Extends the permission-prompt timeout from 30s to 110s | An unanswered prompt is reported to Claude as a refusal |
 | Extends the side-panel retry loop from 5 to 60 tries | The injected panel takes longer to start than a real side panel |
 
@@ -89,4 +87,4 @@ Arc has no tab groups, so there was no way to see which tabs Claude was working 
 
 - **[Anthropic](https://claude.ai)** — Claude for Chrome, the extension all of this patches.
 - **[chxsong/Claude-in-Arc](https://github.com/chxsong/Claude-in-Arc)** — the upstream project, which established the panel-injection approach this fork builds on.
-- This fork adds the debugger-free interaction tools, the session border, and the sign-in and tool-routing fixes above.
+- This fork adds the session border, self-updating, and the sign-in and tool-routing fixes above.
