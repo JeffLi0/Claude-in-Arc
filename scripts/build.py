@@ -110,6 +110,17 @@ BUNDLE_PATCHES = [
         r"return/*ARC PATCH: no tab groups in Arc*/!0}",
     ),
     (
+        # Given no tabId, the MCP tool executor falls back to the first tab in
+        # Claude's group. In Arc that can be any of the user's tabs, so a
+        # navigate without a tabId replaced the page the user had open.
+        # arc-bridge-interceptor.js rejects such calls, and any navigate of a
+        # tab Claude didn't open, before a tab is resolved.
+        "no implicit tab",
+        "assets/mcpPermissions-*.js",
+        r"(async function \w+\((\w+)\)\{)(const \w+=\{\.\.\.\2,args:\w+\(\2\.toolName,\2\.args\)\})",
+        r'\1/*ARC PATCH: no implicit tab*/if(self._arcCheckToolTab){const __arcTabErr=await self._arcCheckToolTab(\2);if(__arcTabErr)return{content:[{type:"text",text:__arcTabErr}],is_error:!0}}\3',
+    ),
+    (
         # Every Arc profile gets the "wants to connect" request and opens its
         # prompt in whatever space is on screen, so they all pile up there.
         # Hand the prompt to arc-pairing-space.js, which opens it only while

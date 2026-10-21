@@ -12,7 +12,7 @@
  * them here via self._arcBridgeInterceptor.handleBridgeToolCall().
  */
 
-const _INTERCEPTOR_VERSION = '0.8.0';
+const _INTERCEPTOR_VERSION = '0.9.0';
 
 function _ok(text) {
   return { content: [{ type: 'text', text }] };
@@ -66,12 +66,103 @@ function _touchSession(tabId) {
   try { self._arcSessionTracker?.touch(tabId); } catch (e) {}
 }
 
+// Tabs Claude opened: by tabs_create_mcp, or from a page in one of them (a
+// link with target=_blank, a popup). In Chrome these are the tabs in Claude's
+// group, the only ones its tools can reach. Arc has no groups, so every tab
+// is reachable, and this list is what keeps navigate off the user's own.
+// Kept in storage.session so a service-worker restart doesn't forget it.
+const _OWNED_KEY = 'arc_claude_owned_tabs';
+let _ownedTail = Promise.resolve();
+
+function _updateOwned(fn) {
+  const run = _ownedTail.then(async () => {
+    const r = await chrome.storage.session.get(_OWNED_KEY);
+    const next = fn(new Set(r[_OWNED_KEY] || []));
+    if (next) await chrome.storage.session.set({ [_OWNED_KEY]: [...next] });
+  });
+  _ownedTail = run.catch(() => {});
+  return run;
+}
+
+async function _ownedTabs() {
+  await _ownedTail;
+  const r = await chrome.storage.session.get(_OWNED_KEY);
+  return new Set(r[_OWNED_KEY] || []);
+}
+
+function _ownTab(tabId) {
+  return _updateOwned(owned => owned.add(tabId));
+}
+
+chrome.tabs.onCreated.addListener((tab) => {
+  if (tab.openerTabId === undefined) return;
+  _updateOwned(owned => owned.has(tab.openerTabId) ? owned.add(tab.id) : null).catch(() => {});
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  _updateOwned(owned => owned.delete(tabId) ? owned : null).catch(() => {});
+});
+
+// Tools that don't act on a page.
+const _TAB_FREE_TOOLS = new Set(['tabs_context_mcp', 'tabs_create_mcp', 'shortcuts_list']);
+
+// Same parsing upstream applies to a tool's tabId.
+function _tabIdArg(v) {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : undefined;
+  if (typeof v === 'string' && v.trim() !== '') {
+    const n = Number(v);
+    if (!Number.isNaN(n)) return n;
+  }
+  return undefined;
+}
+
+// Called by upstream's MCP tool executor before it resolves the target tab
+// (the "no implicit tab" patch in scripts/build.py). Given no tabId, upstream
+// falls back to the first tab in Claude's group, which in Chrome is always
+// Claude's own. In Arc it can be any of the user's tabs, and a navigate sent
+// without a tabId replaced whatever page the user had open there. Returns an
+// error message to reject the call, or null to let it run.
+async function _checkToolTab(call) {
+  // The panel's own agent works on the tab it's open in; only Claude Code and
+  // Claude Desktop come in over these.
+  if (call?.source !== 'bridge' && call?.source !== 'native-messaging') return null;
+  const isBatch = call.toolName === 'browser_batch';
+  if (isBatch && !Array.isArray(call.args?.actions)) return null;
+  const steps = isBatch
+    ? call.args.actions.map(a => ({ name: a?.name, args: a?.input }))
+    : [{ name: call.toolName, args: call.args }];
+
+  let owned;
+  for (const [i, step] of steps.entries()) {
+    if (typeof step.name !== 'string' || _TAB_FREE_TOOLS.has(step.name)) continue;
+    const where = isBatch ? `browser_batch actions[${i}] (${step.name})` : step.name;
+    const tabId = _tabIdArg(step.args?.tabId);
+    if (tabId === undefined) {
+      return `${where} needs a tabId. In Arc there is no default tab: without one, ` +
+        `the action could land in one of the user's own tabs. Call tabs_create_mcp ` +
+        `to open a tab for this task and pass its tabId.`;
+    }
+    if (step.name === 'navigate') {
+      owned ??= await _ownedTabs();
+      if (!owned.has(tabId)) {
+        return `${where} can't change tab ${tabId}: it's one of the user's own tabs, ` +
+          `not one opened for this task. Call tabs_create_mcp and navigate the new ` +
+          `tab instead. Reading and interacting with the user's tabs still works.`;
+      }
+    }
+  }
+  return null;
+}
+
+self._arcCheckToolTab = _checkToolTab;
+
 const TOOL_HANDLERS = {
   async tabs_context_mcp(args) {
     const { createIfEmpty } = args || {};
     const tabs = await _queryUserTabs();
     if (tabs.length === 0 && createIfEmpty) {
       const newTab = await chrome.tabs.create({ active: false, url: 'about:blank' });
+      await _ownTab(newTab.id);
       return _buildTabContext(newTab.id);
     }
     return _buildTabContext(await _getActiveTabId());
@@ -79,6 +170,7 @@ const TOOL_HANDLERS = {
 
   async tabs_create_mcp(_args) {
     const newTab = await chrome.tabs.create({ active: false, url: 'about:blank' });
+    await _ownTab(newTab.id);
     _touchSession(newTab.id);
     return _buildTabContext(newTab.id);
   },

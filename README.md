@@ -48,7 +48,7 @@ Arc doesn't implement two of the extension APIs Claude is built on, and it hosts
 | What's missing | What broke | Fix |
 | --- | --- | --- |
 | `chrome.sidePanel` | The panel never opened | Renders as an injected iframe beside the page |
-| `chrome.tabGroups` | Tool calls were rejected as *"not in Claude's tab group"*, and opening a tab for Claude hung | Tab confinement can't exist in Arc, so it's switched off, and [`arc-bridge-interceptor.js`](arc/arc-bridge-interceptor.js) answers the tab tools without groups |
+| `chrome.tabGroups` | Tool calls were rejected as *"not in Claude's tab group"*, and opening a tab for Claude hung | Tab confinement can't exist in Arc, so it's switched off, and [`arc-bridge-interceptor.js`](arc/arc-bridge-interceptor.js) answers the tab tools without groups. To keep Claude Code and Claude Desktop from navigating your own tabs, every page tool needs an explicit `tabId`, and `navigate` only works on tabs Claude opened |
 | A real side panel | Sign-in reported *"Can't reach the Claude extension"* despite valid tokens | Defaults back to the classic panel, which doesn't need one |
 
 Clicks, typing, screenshots, `find`, `read_page` and JavaScript all run on Anthropic's own code. Older Arc releases never let `chrome.debugger` attach, and this fork used to reimplement those tools without it; current Arc does, so they now work as they do in Chrome, site permissions included.
@@ -62,11 +62,12 @@ The repo stores only the Arc patches, never a copy of Anthropic's extension. [`s
 1. It downloads the current release from the Chrome Web Store.
 2. It copies the scripts in [`arc/`](arc/) into the extension.
 3. It loads those scripts through the manifest, the service-worker loader and `sidepanel.html`.
-4. It makes nine small edits to Anthropic's minified code. Each edit is marked with an `ARC PATCH` comment:
+4. It makes ten small edits to Anthropic's minified code. Each edit is marked with an `ARC PATCH` comment:
 
 | Edit | Why |
 | --- | --- |
 | Turns off the three tab-group checks on tool calls | Arc has no tab groups, so these checks can only reject |
+| Rejects tool calls without a `tabId`, and `navigate` on tabs Claude didn't open | Upstream's fallback is "the first tab in Claude's group", which in Arc can be one of your tabs |
 | Keeps the classic panel instead of the new claude.ai-embedded one | The embed needs claude.ai's cookies, which Arc partitions away inside the injected panel, so it always shows *"Sign in to Claude"* |
 | Tags onboarding prompts with their tab, and has panels ignore other tabs' prompts | Hidden panels stay loaded in other tabs, and one of them could take the "Start challenge" prompt, leaving the new panel empty |
 | Hands the "wants to connect" prompt to [`arc-pairing-space.js`](arc/arc-pairing-space.js) | Arc opens every profile's prompt in the space on screen; this opens each in its own profile's space |
