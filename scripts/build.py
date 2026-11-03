@@ -117,7 +117,7 @@ BUNDLE_PATCHES = [
         # tab Claude didn't open, before a tab is resolved.
         "no implicit tab",
         "assets/mcpPermissions-*.js",
-        r"(async function \w+\((\w+)\)\{)(const \w+=\{\.\.\.\2,args:\w+\(\2\.toolName,\2\.args\)\})",
+        r"(async function \w+\((\w+)\)\{)(const \w+=\{\.\.\.\2,args:\w+\(\2\.toolName,\2\.args\))",
         r'\1/*ARC PATCH: no implicit tab*/if(self._arcCheckToolTab){const __arcTabErr=await self._arcCheckToolTab(\2);if(__arcTabErr)return{content:[{type:"text",text:__arcTabErr}],is_error:!0}}\3',
     ),
     (
