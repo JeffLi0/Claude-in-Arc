@@ -106,8 +106,8 @@ BUNDLE_PATCHES = [
         # any tab that exists qualifies; both tabs.get calls must still succeed.
         "tab-group check (batch)",
         "assets/mcpPermissions-*.js",
-        r"return (\w+)\.groupId===chrome\.tabGroups\.TAB_GROUP_ID_NONE\?\w+===\w+:\w+\.groupId===\w+\.groupId\}",
-        r"return/*ARC PATCH: no tab groups in Arc*/!0}",
+        r"async isTabInSameGroup\((\w+),(\w+)\)\{try\{.*?\}catch\((\w+)\)\{return!1\}\}",
+        r"async isTabInSameGroup(\1,\2){try{/*ARC PATCH: no tab groups in Arc*/await Promise.all([chrome.tabs.get(\1),chrome.tabs.get(\2)]);return!0}catch(\3){return!1}}",
     ),
     (
         # Given no tabId, the MCP tool executor falls back to the first tab in
