@@ -28,9 +28,12 @@ jobs:
       # GitHub pauses scheduled workflows after 60 days without commits, and
       # the releases this publishes don't count. Re-enabling the workflow does,
       # so the daily check never lapses and no keepalive commits are needed.
-      # It runs first so a failing build can't skip it.
+      # It runs first so a failing build can't skip it, and a flaky API call
+      # here can't fail the run: any one success in 60 days is enough.
       - name: Keep the schedule alive
         if: github.event_name == 'schedule'
+        continue-on-error: true
+        timeout-minutes: 2
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/release.yml/enable"
