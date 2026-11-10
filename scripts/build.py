@@ -360,6 +360,9 @@ def patch_offscreen_html(out):
 def apply_bundle_patches(out):
     failures = []
     for name, pattern_glob, pattern, repl in BUNDLE_PATCHES:
+        # Minified names can contain $ (1.0.106 named a timeout $M), which \w
+        # misses, so \w in a pattern means any identifier character.
+        pattern = pattern.replace(r"\w", r"[\w$]")
         files = glob.glob(os.path.join(out, pattern_glob))
         hits = [(f, len(re.findall(pattern, read(f)))) for f in files]
         total = sum(n for _, n in hits)

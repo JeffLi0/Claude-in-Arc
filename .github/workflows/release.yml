@@ -1,11 +1,9 @@
-# Rebuilds Claude in Arc whenever Anthropic ships a new Claude in Chrome (checked
-# daily), and whenever the Arc patches change. A failed run means an upstream release
-# moved code a patch depends on; GitHub emails the repo owner about it.
+# Rebuilds Claude in Arc from the latest Claude in Chrome whenever the Arc
+# patches change, or when run by hand. It no longer checks upstream daily: Arc
+# is being sunset, and each upstream release could break a patch.
 name: Release
 
 on:
-  schedule:
-    - cron: "17 6 * * *"
   workflow_dispatch:
   push:
     branches: [main]
@@ -13,7 +11,6 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 concurrency:
   group: release
@@ -24,19 +21,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # GitHub pauses scheduled workflows after 60 days without commits, and
-      # the releases this publishes don't count. Re-enabling the workflow does,
-      # so the daily check never lapses and no keepalive commits are needed.
-      # It runs first so a failing build can't skip it, and a flaky API call
-      # here can't fail the run: any one success in 60 days is enough.
-      - name: Keep the schedule alive
-        if: github.event_name == 'schedule'
-        continue-on-error: true
-        timeout-minutes: 2
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/release.yml/enable"
 
       - name: Check upstream version
         id: upstream
@@ -51,10 +35,7 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Scheduled runs only act on a new upstream version; pushes and manual
-      # runs rebuild the current one with the latest patches.
       - name: Build
-        if: steps.upstream.outputs.exists == 'false' || github.event_name != 'schedule'
         run: python3 scripts/build.py --zip
 
       - name: Publish release
@@ -68,7 +49,7 @@ jobs:
             --notes "Built from Claude in Chrome $VERSION with the Arc patches applied. Unzip, then load the folder in arc://extensions (or replace the folder you loaded before and click reload)."
 
       - name: Refresh release assets
-        if: steps.upstream.outputs.exists == 'true' && github.event_name != 'schedule'
+        if: steps.upstream.outputs.exists == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.upstream.outputs.version }}
